@@ -9,7 +9,7 @@
 (require racket/string racket/promise
          rangi/src/types/canon rangi/src/types/desc rangi/src/types/reference
          (only-in rangi/src/types/provider make-env make-declaration-provider prefer-local-policy
-                  env-type [resolve-type-name find-type-name]))
+                  first-match-policy env-type [resolve-type-name find-type-name]))
 (provide reference-assemblies-dir mscorlib-path
          tui-configure! tui-add-reference! tui-add-open! tui-references
          resolve-type-name class-of tui-type->il tui-type->string value-type? numeric-type?
@@ -115,7 +115,8 @@
               (and d (with-args (type-desc-ref d) args)))))]))
 
 (define (resolve-ref id arity)
-  (find-type-name (the-env) id #:arity arity #:policy (prefer-local-policy local-asm)))
+  (find-type-name (the-env) id #:arity arity
+                  #:policy (prefer-local-policy local-asm first-match-policy)))
 
 (define (sub-id id text) (datum->syntax id (string->symbol text) id))
 
