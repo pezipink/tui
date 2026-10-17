@@ -125,7 +125,7 @@
 
   ; A type annotation (an identifier) to a Tui type.
   (define (ann->type stx)
-    (or (and (identifier? stx) (resolve-type-name (syntax-e stx)))
+    (or (and (identifier? stx) (resolve-type-name stx))
         (raise-syntax-error 'tui "unknown type" stx)))
 
   ; Errors from the CLR layer become syntax errors at stx.
@@ -224,8 +224,8 @@
 
   (define (clr-call-instr op m)
     `(,op ,@(if (clr-method-static? m) '() '(instance))
-          ,(tui-type->il (clr-method-ret m)) ,(owner->il (clr-method-owner m))
-          ,(string->symbol (clr-method-name m)) ,(map tui-type->il (clr-method-params m))))
+          ,(clr-method-il-ret m) ,(owner->il (clr-method-owner m))
+          ,(string->symbol (clr-method-name m)) ,(clr-method-il-params m)))
 
   ;; Module-level form classification, shared by #%module-begin and #%top-interaction.
   (define (form-kind f)
@@ -403,9 +403,9 @@
      (define-values (m convs)
        (with-clr stx (λ () (resolve-overload (list (find-constructors t)) tys
                                              (format "new ~a" (tui-type->string t))))))
-     (il (resolve-type-name (syntax-e #'type))
+     (il (ann->type #'type)
          (append (args-code codes convs)
-                 `((newobj ,(owner->il t) ,(map tui-type->il (clr-method-params m))))))]))
+                 `((newobj ,(owner->il t) ,(clr-method-il-params m)))))]))
 
 (define-tui-form (tui-begin stx)
   (syntax-parse stx

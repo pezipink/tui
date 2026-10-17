@@ -34,6 +34,15 @@
   (check-equal? (list-tail out 15)
                 '("ababab" "one is not two" "github.com" "/pezipink/rangi")))
 
+(test-case "generic instances call members on the open signature"
+  (check-equal?
+   (run-tui '(let ([l (new System.Collections.Generic.List<int>)])
+               (.Add l 3)
+               (.Add l 4)
+               (Console.WriteLine (.get_Count l))
+               (Console.WriteLine (.get_Item l 1))))
+   '("2" "4")))
+
 (test-case "the REPL runs each interaction against the module's functions"
   (define mod (build-path examples "basics.rkt"))
   (dynamic-require mod #f)
