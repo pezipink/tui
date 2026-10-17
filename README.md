@@ -35,7 +35,8 @@ Install Tui itself with `raco pkg install --link --name tui c:\repos\tui`.
 ```
 
 * Types: `int`/`int32`, `long`/`int64`, `double`/`float64`, `bool`, `char`, `string`, `object`, `void`, and any public .NET class by name.
-* Forms: `define`, `let`, `set!`, `begin`, `if`, `while`, `and`, `or`, `not`, `new`, the arithmetic operators `+ - * / %` (`+` also joins strings), the comparisons `< > <= >=`, and `=`.
+* Forms: `define`, `let`, `set!`, `begin`, `if`, `while`, `and`, `or`, `not`, `new`, `list-of`, the arithmetic operators `+ - * / %` (`+` also joins strings), the comparisons `< > <= >=`, and `=`.
+* `(list-of e ...)` builds a `System.Collections.Generic.List<T>`. T is the type of the first element and every other element must convert to it. `(list-of 1 "a")` is a type error. An empty list needs `(new System.Collections.Generic.List<T>)`.
 * Overloads are resolved at expansion time. The implicit conversions are widening (int32 to int64, integers to float64), boxing to `object`, and reference types to `object`.
 * Macros are ordinary hygienic `define-syntax-rule` macros.
 

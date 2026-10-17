@@ -43,6 +43,29 @@
                (Console.WriteLine (.get_Item l 1))))
    '("2" "4")))
 
+(test-case "list-of infers its element type from the first element"
+  (check-equal?
+   (run-tui '(let ([xs (list-of 1 2 3)])
+               (Console.WriteLine (.get_Count xs))
+               (Console.WriteLine (.get_Item xs 2))
+               (.Add xs 4)
+               (Console.WriteLine (.get_Count xs))))
+   '("3" "3" "4"))
+  (check-equal?
+   (run-tui '(let ([names (list-of "a" "b")])
+               (.Add names "c")
+               (Console.WriteLine (.get_Item names 2))))
+   '("c")))
+
+(test-case "the list-of example runs"
+  (check-equal? (run-example "lists.rkt") '("3" "linus" "6")))
+
+(test-case "list-of rejects elements and calls that do not match its type"
+  (check-regexp-match #rx"expected int32, got string" (tui-error '(list-of 1 "a")))
+  (check-regexp-match #rx"no overload of .*Add accepts \\(int32\\)"
+                      (tui-error '(let ([xs (list-of "a")]) (.Add xs 1))))
+  (check-regexp-match #rx"list-of needs an element" (tui-error '(list-of))))
+
 (test-case "the REPL runs each interaction against the module's functions"
   (define mod (build-path examples "basics.rkt"))
   (dynamic-require mod #f)

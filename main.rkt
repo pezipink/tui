@@ -13,7 +13,7 @@
                      [tui-app #%app] [tui-datum #%datum] [tui-top #%top]
                      [tui-define define] [tui-let let] [tui-set! set!] [tui-if if]
                      [tui-while while] [tui-begin begin] [tui-and and] [tui-or or] [tui-not not]
-                     [tui-new new]
+                     [tui-new new] [tui-list-of list-of]
                      [tui-+ +] [tui-- -] [tui-* *] [tui-/ /] [tui-% %]
                      [tui-< <] [tui-> >] [tui-<= <=] [tui->= >=] [tui-= =])
          ; syntax-rules compiles its patterns at phase 1, so the ellipsis is needed there too
@@ -406,6 +406,37 @@
      (il (ann->type #'type)
          (append (args-code codes convs)
                  `((newobj ,(owner->il t) ,(clr-method-il-params m)))))]))
+
+; (list-of e ...) builds a System.Collections.Generic.List<T>, where T is the type of the first
+; element. The expansion is looked up in the type environment: the List definition is instantiated
+; at T, its parameterless constructor and Add are chosen from the closed type, and every other
+; element is checked against T, so a mismatch is a compile error at that element.
+(begin-for-syntax
+  (define (list-code stx elem-codes elem-type)
+    (define inst (with-clr stx (λ () (generic-instance "System.Collections.Generic.List"
+                                                       (list elem-type)))))
+    (unless inst
+      (raise-syntax-error 'tui (format "cannot form a List of ~a" (tui-type->string elem-type))
+                          stx))
+    (define-values (ctor _c)
+      (with-clr stx (λ () (resolve-overload (list (find-constructors inst)) '() "new List"))))
+    (define-values (add _a)
+      (with-clr stx (λ () (resolve-overload (find-instance-methods inst "Add") (list elem-type)
+                                            "List.Add"))))
+    (il inst (append `((newobj ,(owner->il inst) ,(clr-method-il-params ctor)))
+                     (append* (for/list ([c (in-list elem-codes)])
+                                (append '((dup)) c (list (clr-call-instr 'callvirt add)))))))))
+
+(define-tui-form (tui-list-of stx)
+  (syntax-parse stx
+    [(_) (raise-syntax-error
+          'tui "list-of needs an element to infer the type; for an empty list use (new System.Collections.Generic.List<T>)"
+          stx)]
+    [(_ e0 e ...)
+     (define-values (elem c0) (tc #'e0))
+     (when (eq? elem 'void) (raise-syntax-error 'tui "list elements cannot be void" #'e0))
+     (define rest-codes (for/list ([x (in-list (syntax->list #'(e ...)))]) (tc/expect x elem)))
+     (list-code stx (cons c0 rest-codes) elem)]))
 
 (define-tui-form (tui-begin stx)
   (syntax-parse stx

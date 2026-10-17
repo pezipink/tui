@@ -12,8 +12,8 @@
                   first-match-policy env-type [resolve-type-name find-type-name]))
 (provide reference-assemblies-dir mscorlib-path
          tui-configure! tui-add-reference! tui-add-open! tui-references
-         resolve-type-name class-of tui-type->il tui-type->string value-type? numeric-type?
-         coercion
+         resolve-type-name generic-instance class-of tui-type->il tui-type->string value-type?
+         numeric-type? coercion
          (struct-out clr-method) find-static-methods find-instance-methods find-constructors
          resolve-overload owner->il)
 
@@ -144,6 +144,14 @@
   (cond
     [(assq (syntax-e id) primitive-aliases) => cdr]
     [else (ref->tui (resolve-ref-of id))]))
+
+; The Tui type of a generic definition instantiated at args (Tui types), e.g.
+; (generic-instance "System.Collections.Generic.List" '(int32)), or #f when it cannot be formed.
+(define (generic-instance full-name args)
+  (define base (resolve-ref (datum->syntax #f (string->symbol full-name)) (length args)))
+  (define refs (map tui->ref args))
+  (and base (andmap values refs)
+       (ref->tui (with-args base refs))))
 
 ; A dotted type name in a string, e.g. "System.Console".
 (define (resolve-clr-type-name full)
