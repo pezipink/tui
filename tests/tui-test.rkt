@@ -58,7 +58,18 @@
    '("c")))
 
 (test-case "the list-of example runs"
-  (check-equal? (run-example "lists.rkt") '("3" "linus" "6" "adagracelinus" "6")))
+  (check-equal? (run-example "lists.rkt") '("3" "linus" "6" "pink squirrel labs" "24")))
+
+(test-case "default-of takes a type name and expands to its default value"
+  (check-equal? (run-example "types.rkt") '("0" "False" "0" "0" "0")))
+
+(test-case "default-of rejects types whose default it cannot build"
+  (define types-path (path->string (build-path examples "types.rkt")))
+  (check-regexp-match #rx"default-of supports int32, bool, float64, string and classes .*, got int64"
+                      (tui-error `(require (file ,types-path)) '(default-of int64)))
+  (check-regexp-match #rx"got System.Console"
+                      (tui-error `(require (file ,types-path)) '(default-of System.Console)))
+  (check-regexp-match #rx"unknown type" (tui-error `(require (file ,types-path)) '(default-of Nope))))
 
 (test-case "sum-of reads the element type from the closed List's metadata"
   (check-regexp-match #rx"sum-of needs a list of int32 or string elements, got bool"

@@ -22,7 +22,8 @@
          using open define-syntax-rule define-syntax define-syntax-parser require provide
          for-syntax file
          ... _ (for-syntax ... _)
-         (for-syntax tui-type-of tui-member-return-type tui-type->string))
+         (for-syntax tui-type-of tui-member-return-type tui-type->string class-of
+                     tui-resolve-type tui-has-default-ctor?))
 
 (module reader syntax/module-reader tui)
 
@@ -271,6 +272,15 @@
   (define (tui-type-of stx)
     (define-values (ty _code) (tc stx))
     ty)
+
+  ; The Tui type named by an identifier in a macro argument, or a syntax error.
+  (define (tui-resolve-type id)
+    (or (resolve-type-name id) (raise-syntax-error 'tui "unknown type" id)))
+
+  ; Whether the type t is a class with a public constructor that takes no arguments.
+  (define (tui-has-default-ctor? t)
+    (and (pair? t)
+         (ormap (λ (m) (null? (clr-method-params m))) (find-constructors (class-of t)))))
 
   ; The return type of the first public instance method named name on the class type t, read from
   ; the metadata of the closed type, or #f when there is no such method.

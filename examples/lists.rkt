@@ -36,6 +36,6 @@
     (set! i (+ i 1)))
   (Console.WriteLine total))
 
-(let ([words (list-of "ada" "grace" "linus")])
-  (Console.WriteLine (sum-of words)))
-(Console.WriteLine (sum-of (list-of 1 2 3)))
+(let ([words (list-of "pink" " squirrel " "labs")])
+(Console.WriteLine (sum-of words)))
+(Console.WriteLine (sum-of (list-of 12 6 6)))
