@@ -15,7 +15,7 @@
          resolve-type-name generic-instance class-of tui-type->il tui-type->string value-type?
          numeric-type? coercion
          (struct-out clr-method) find-static-methods find-instance-methods find-constructors
-         resolve-overload owner->il)
+         resolve-overload owner->il base-type)
 
 (define reference-assemblies-dir
   "C:/Program Files (x86)/Reference Assemblies/Microsoft/Framework/.NETFramework/v4.7.1/")
@@ -120,17 +120,33 @@
 
 (define (sub-id id text) (datum->syntax id (string->symbol text) id))
 
-; The canonical reference an identifier names, or #f. Name<arg> names a generic instance of one
-; argument, and the argument may itself be generic.
+; The canonical reference an identifier names, or #f. Name<A, B> names a generic instance whose
+; arguments may themselves be generic (Func<A, B> is Func`2). Multi-argument names need pipes in
+; Racket source, e.g. |Func<int32, int32>|, because the reader splits at a comma.
 (define (resolve-ref-of id)
   (define sym (syntax-e id))
   (define m (regexp-match #rx"^([^<>]+)<(.+)>$" (symbol->string sym)))
   (cond
     [(assq sym primitive-aliases) => (λ (p) (tui-prim-ref (cdr p)))]
-    [m (let* ([base (resolve-ref (sub-id id (cadr m)) 1)]
-              [arg (and base (resolve-ref-of (sub-id id (caddr m))))])
-         (and base arg (with-args base (list arg))))]
+    [m (let* ([args (for/list ([a (in-list (split-type-args (caddr m)))])
+                      (resolve-ref-of (sub-id id a)))]
+              [base (and (andmap values args)
+                         (resolve-ref (sub-id id (cadr m)) (length args)))])
+         (and base (andmap values args) (with-args base args)))]
     [else (resolve-ref id 0)]))
+
+; The arguments of a generic name, split at its top-level commas: "A, B<C, D>" is ("A" "B<C, D>").
+(define (split-type-args s)
+  (let loop ([cs (string->list s)] [depth 0] [cur '()] [acc '()])
+    (define (piece) (string-trim (list->string (reverse cur))))
+    (cond
+      [(null? cs) (reverse (cons (piece) acc))]
+      [(and (char=? (car cs) #\,) (zero? depth))
+       (loop (cdr cs) depth '() (cons (piece) acc))]
+      [else
+       (define c (car cs))
+       (define d (cond [(char=? c #\<) (add1 depth)] [(char=? c #\>) (sub1 depth)] [else depth]))
+       (loop (cdr cs) d (cons c cur) acc)])))
 
 (define (class-args t) (list-ref t 4))
 

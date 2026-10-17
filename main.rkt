@@ -16,7 +16,7 @@
                      [tui-app #%app] [tui-datum #%datum] [tui-top #%top]
                      [tui-define define] [tui-let let] [tui-set! set!] [tui-if if]
                      [tui-while while] [tui-begin begin] [tui-and and] [tui-or or] [tui-not not]
-                     [tui-new new] [tui-list-of list-of]
+                     [tui-new new] [tui-list-of list-of] [tui-fn fn]
                      [tui-+ +] [tui-- -] [tui-* *] [tui-/ /] [tui-% %]
                      [tui-< <] [tui-> >] [tui-<= <=] [tui->= >=] [tui-= =])
          ; syntax-rules compiles its patterns at phase 1, so the ellipsis is needed there too
@@ -59,17 +59,56 @@
 
 (begin-for-syntax
   ;; Per-method state: local variable types (in slot order) and a label counter.
-  (struct mctx ([locals #:mutable] [labels #:mutable]))
+  ; captured holds the names (symbols) that a fn in this body mentions. Those variables live in
+  ; one-element arrays (cells) so a lambda can share them. parent is the enclosing method of a
+  ; lambda. env lists the (variable . local) pairs that a lambda reads from its env array.
+  (struct mctx ([locals #:mutable] [labels #:mutable] captured parent [env #:mutable]))
+  (struct cell-of (type))
   (define current-mctx (make-parameter #f))
+
+  ; Lambda bodies become static methods of Program. Each (name . method) waits here until a
+  ; tui-lifts-into adds it to the program, which happens after the expansion that compiled it.
+  (define lifted-methods (box '()))
+  (define lambda-count (box 0))
 
   (define (the-mctx stx)
     (or (current-mctx) (raise-syntax-error 'tui "Tui expression outside a method body" stx)))
 
-  (define (alloc-local! stx ty)
-    (define m (the-mctx stx))
+  (define (alloc-local! stx ty) (alloc-local-in! (the-mctx stx) ty))
+
+  (define (new-cell-code ty) (list '(ldc.i4.1) `(newarr ,(tui-type->il ty))))
+
+  (define (alloc-local-in! m ty)
     (define i (length (mctx-locals m)))
     (set-mctx-locals! m (append (mctx-locals m) (list ty)))
     i)
+
+  (define (new-mctx forms parent) (mctx '() 0 (captured-names forms) parent '()))
+
+  ; The names (symbols) that a fn form in forms mentions. Matching is by name, so a name can be
+  ; included when the fn does not really capture it; that only costs a cell.
+  (define (captured-names forms)
+    (define found (make-hasheq))
+    (define (mark! e)
+      (cond
+        [(identifier? e) (hash-set! found (syntax-e e) #t)]
+        [(syntax? e) (mark! (syntax-e e))]
+        [(pair? e) (mark! (car e)) (mark! (cdr e))]
+        [else (void)]))
+    (define (fn-form? e)
+      (and (identifier? (car e)) (free-identifier=? (car e) #'tui-fn)))
+    (define (scan e)
+      (cond
+        [(syntax? e) (scan (syntax-e e))]
+        [(pair? e) (if (fn-form? e) (mark! (cdr e)) (scan-list e))]
+        [else (void)]))
+    (define (scan-list l)
+      (cond
+        [(pair? l) (scan (car l)) (scan-list (cdr l))]
+        [(syntax? l) (scan-list (syntax-e l))]
+        [else (void)]))
+    (scan-list forms)
+    found)
 
   (define (fresh-label! stx base)
     (define m (the-mctx stx))
@@ -102,15 +141,57 @@
     (for/lists (tys codes) ([s (in-list stxs)]) (tc s)))
 
   ; Variables. kind is 'arg or 'local; the binding's value is the transformer itself, so
-  ; set! can find the slot with syntax-local-value.
-  (struct tui-var (kind index type)
+  ; set! can find the slot with syntax-local-value. owner is the method the slot belongs to, so
+  ; a lambda body (its own method) cannot reach the enclosing method's slots.
+  ; kind is 'arg, 'local (a plain slot of owner's method) or 'cell (index is the local of owner
+  ; that holds the cell array; the variable's value is element 0).
+  (struct tui-var (kind index type owner)
     #:property prop:procedure
     (λ (self stx)
-      (if (identifier? stx)
-          (il (tui-var-type self) (list (var-instr 'ld (tui-var-kind self) (tui-var-index self))))
-          (raise-syntax-error 'tui "a variable cannot be called" stx))))
+      (cond
+        [(not (identifier? stx)) (raise-syntax-error 'tui "a variable cannot be called" stx)]
+        [else (il (tui-var-type self) (load-var self stx))])))
 
-  (define (make-tui-var kind index type) (tui-var kind index type))
+  (define (make-tui-var kind index type) (tui-var kind index type (current-mctx)))
+
+  (define (plain-slot v m stx)
+    (unless (eq? (tui-var-owner v) m)
+      (raise-syntax-error 'tui
+                          (format "a lambda can only capture ~a if its enclosing method names it in a fn form"
+                                  (syntax-e stx))
+                          stx))
+    (tui-var-index v))
+
+  ; The local of m that holds v's cell. A lambda reads the cells it uses from its env array, and
+  ; a lambda inside a lambda gets them from its parent, so each level adds what it needs.
+  (define (cell-slot-in m v)
+    (cond
+      [(eq? (tui-var-owner v) m) (tui-var-index v)]
+      [(assq v (mctx-env m)) => cdr]
+      [else
+       (let ([p (or (mctx-parent m) (error 'tui "internal: a cell has no enclosing method"))])
+         (cell-slot-in p v)
+         (let ([j (alloc-local-in! m (cell-of (tui-var-type v)))])
+           (set-mctx-env! m (append (mctx-env m) (list (cons v j))))
+           j))]))
+
+  (define (load-var v stx)
+    (define m (the-mctx stx))
+    (case (tui-var-kind v)
+      [(cell) (append (list (var-instr 'ld 'local (cell-slot-in m v)))
+                      '((ldc.i4.0))
+                      `((ldelem ,(tui-type->il (tui-var-type v)))))]
+      [else (list (var-instr 'ld (tui-var-kind v) (plain-slot v m stx)))]))
+
+  ; Code that stores the value pushed by value-code into v.
+  (define (store-var v stx value-code)
+    (define m (the-mctx stx))
+    (case (tui-var-kind v)
+      [(cell) (append (list (var-instr 'ld 'local (cell-slot-in m v)))
+                      '((ldc.i4.0))
+                      value-code
+                      `((stelem ,(tui-type->il (tui-var-type v)))))]
+      [else (append value-code (list (var-instr 'st (tui-var-kind v) (plain-slot v m stx))))]))
 
   ; III.3.38 ldarg, III.3.43 ldloc, III.3.61 starg, III.3.63 stloc, short forms where they fit.
   (define (var-instr op kind i)
@@ -183,11 +264,33 @@
       [_ (raise-syntax-error 'tui "expected (define (name [param : type] ...) : type body ...+)"
                              def)]))
 
-  ; Compiles one method body. binds are (id kind index type); returns the body instructions with
-  ; the return conversion and ret, plus the locals the body allocated.
-  (define (compile-body stx binds body rty)
-    (parameterize ([current-mctx (mctx '() 0)])
-      (define-values (bty code) (tc/bind binds #`(tui-begin #,@body)))
+  ; Compiles one method body. binds are (id kind index type) and parent is the enclosing method of
+  ; a lambda (#f for a method). Returns the instructions, with the return conversion and ret, and
+  ; the mctx that holds the locals and the lambda's env.
+  (define (compile-body stx binds body rty parent)
+    (define m (new-mctx body parent))
+    (parameterize ([current-mctx m])
+      ; A captured argument is copied into a cell, so the lambda and its enclosing method share it.
+      (define-values (cell-binds arg-code)
+        (for/fold ([bs '()] [code '()] #:result (values (reverse bs) (append* (reverse code))))
+                  ([b (in-list binds)])
+          (define id (car b))
+          (define kind (cadr b))
+          (define index (caddr b))
+          (define ty (cadddr b))
+          (cond
+            [(and (eq? kind 'arg) (hash-ref (mctx-captured m) (syntax-e id) #f))
+             (define j (alloc-local-in! m (cell-of ty)))
+             (values (cons (list id 'cell j ty) bs)
+                     (cons (append (new-cell-code ty)
+                                   (list (var-instr 'st 'local j)
+                                         (var-instr 'ld 'local j)
+                                         '(ldc.i4.0)
+                                         (var-instr 'ld 'arg index)
+                                         `(stelem ,(tui-type->il ty))))
+                           code))]
+            [else (values (cons b bs) code)])))
+      (define-values (bty code) (tc/bind cell-binds #`(tui-begin #,@body)))
       (define ret-code
         (cond
           [(eq? rty 'void) (if (eq? bty 'void) '() '((pop)))]
@@ -195,26 +298,91 @@
           [else (raise-syntax-error 'tui (format "function returns ~a but its body has type ~a"
                                                  (tui-type->string rty) (tui-type->string bty))
                                     stx)]))
-      (values (append code ret-code '((ret))) (mctx-locals (current-mctx)))))
+      ; Copies the env entries that this lambda reads into locals (the env is argument 0).
+      (define env-code
+        (append* (for/list ([e (in-list (mctx-env m))] [k (in-naturals)])
+                   (define T (tui-type->il (tui-var-type (car e))))
+                   (list '(ldarg.0)
+                         `(ldc.i4 ,k)
+                         '(ldelem object)
+                         `(castclass (szarray ,T))
+                         (var-instr 'st 'local (cdr e))))))
+      (values (append env-code arg-code code ret-code '((ret))) m)))
+
+  (define (local-il t)
+    (if (cell-of? t) `(szarray ,(tui-type->il (cell-of-type t))) (tui-type->il t)))
 
   (define (locals-decl locals)
-    (if (null? locals) '() `((.locals init ,(map tui-type->il locals)))))
+    (if (null? locals) '() `((.locals init ,(map local-il locals)))))
 
   (define (compile-function def)
     (define-values (name pnames ptypes ret body) (fun-header def))
     (define ptys (map ann->type ptypes))
     (define rty (ann->type ret))
-    (define-values (code locals)
+    (define-values (code m)
       (compile-body def (for/list ([p pnames] [t ptys] [i (in-naturals)]) (list p 'arg i t))
-                    body rty))
+                    body rty #f))
     `(.method (public static) ,(tui-type->il rty) ,(syntax-e name) ,(map tui-type->il ptys)
               (cil managed)
-              (,@(locals-decl locals) ,@code)))
+              (,@(locals-decl (mctx-locals m)) ,@code)))
+
+  ; Whether the class type t derives from System.MulticastDelegate.
+  (define (delegate-type? t)
+    (let loop ([b (base-type t)])
+      (and b (or (and (equal? (caddr b) "System") (equal? (cadddr b) "MulticastDelegate"))
+                 (loop (base-type b))))))
+
+  ; The delegate type named by a fn form, and the parameter and return types of its Invoke.
+  (define (delegate-signature stx dt-id)
+    (define t (ann->type dt-id))
+    (unless (delegate-type? t)
+      (raise-syntax-error 'tui (format "fn needs a delegate type, got ~a" (tui-type->string t))
+                          dt-id))
+    (define groups (with-clr stx (λ () (find-instance-methods t "Invoke"))))
+    (unless (pair? groups)
+      (raise-syntax-error 'tui "delegate has no Invoke method" dt-id))
+    (define m (car (car groups)))
+    (values t (clr-method-params m) (clr-method-ret m)))
+
+  ; (fn Delegate (param ...) body ...+). The body is a static method of Program that takes the env
+  ; array as its first argument. The value is a delegate over that env, so a lambda reads its
+  ; captured cells from it.
+  (define (compile-lambda stx dt-id pnames body)
+    (define-values (dt ptys rty) (delegate-signature stx dt-id))
+    (unless (= (length pnames) (length ptys))
+      (raise-syntax-error 'tui (format "fn has ~a parameters but ~a takes ~a"
+                                       (length pnames) (tui-type->string dt) (length ptys))
+                          stx))
+    (define parent (current-mctx))
+    (define-values (code m)
+      (compile-body stx (for/list ([p pnames] [t ptys] [i (in-naturals 1)]) (list p 'arg i t))
+                    body rty parent))
+    (define env (mctx-env m))
+    (define n (unbox lambda-count))
+    (set-box! lambda-count (add1 n))
+    (define name (string->symbol (format "__lambda~a" n)))
+    (define params (cons '(szarray object) (map tui-type->il ptys)))
+    (define method
+      `(.method (public static) ,(tui-type->il rty) ,name ,params
+                (cil managed)
+                (,@(locals-decl (mctx-locals m)) ,@code)))
+    (set-box! lifted-methods (cons (cons name method) (unbox lifted-methods)))
+    (define env-build
+      (append* (for/list ([e (in-list env)] [k (in-naturals)])
+                 (list '(dup)
+                       `(ldc.i4 ,k)
+                       (var-instr 'ld 'local (cell-slot-in parent (car e)))
+                       '(stelem object)))))
+    (il dt `((ldc.i4 ,(length env))
+             (newarr object)
+             ,@env-build
+             (ldftn ,(tui-type->il rty) (Program) ,name ,params)
+             (newobj ,(owner->il dt) (object intptr)))))
 
   ; The entry point. With print? the value of the last form, if any, is written to the console.
   (define (compile-main stx forms print?)
     (define-values (code locals)
-      (parameterize ([current-mctx (mctx '() 0)])
+      (parameterize ([current-mctx (new-mctx forms #f)])
         (define-values (ty code) (tc/bind '() #`(tui-begin #,@forms)))
         (define tail
           (cond
@@ -324,6 +492,8 @@
      (define refs (cons mscorlib-path (map using-path (of 'using))))
      (define opens (cons "System" (map open-namespace (of 'open))))
      (tui-configure! refs opens)
+     (set-box! lifted-methods '())
+     (set-box! lambda-count 0)
      (define defs (of 'define))
      (with-syntax ([prog (datum->syntax stx '%tui-program)]
                    [(decl ...) (map fun-declaration defs)]
@@ -337,14 +507,32 @@
           pass ...
           decl ...
           (define prog
-            (make-tui-program (tui-reference-list)
-                              (list (cons 'name (tui-method def)) ...)
-                              (tui-main stmt ...)))
+            (tui-lifting
+             (make-tui-program (tui-reference-list)
+                               (list (cons 'name (tui-method def)) ...)
+                               (tui-main stmt ...))))
           (provide (rename-out [prog tui-program]))
           (module+ main (run-tui-program prog))))]))
 
 (define-syntax (tui-reference-list stx)
   #`(quote #,(tui-references)))
+
+; Adds the lambda bodies compiled so far to p. Use it only in a let body that follows the
+; expression which compiled them (see tui-lifting), so the expansion order is right.
+(define-syntax (tui-lifts-into stx)
+  (syntax-case stx ()
+    [(_ p)
+     (let ([ms (reverse (unbox lifted-methods))])
+       (set-box! lifted-methods '())
+       (with-syntax ([(add ...) (for/list ([m (in-list ms)])
+                                  #`(tui-program-add-method! p '#,(car m)
+                                                             (quote #,(datum->syntax #f (cdr m)))))])
+         #'(begin (void) add ...)))]))
+
+; The value of e, after the lambda bodies that e compiled are added to it.
+(define-syntax (tui-lifting stx)
+  (syntax-case stx ()
+    [(_ e) #'(let ([p e]) (tui-lifts-into p) p)]))
 
 (define-syntax (tui-method stx)
   (syntax-case stx ()
@@ -364,18 +552,23 @@
   (syntax-parse stx
     [(_ . form)
      (define prog (datum->syntax stx '%tui-program))
+     (set-box! lifted-methods '())
      (case (form-kind #'form)
        [(define)
         (define-values (name p t r b) (fun-header #'form))
         #`(begin #,(fun-declaration #'form)
-                 (tui-program-add-method! #,prog '#,name (tui-method form)))]
+                 (let ([v (tui-program-add-method! #,prog '#,name (tui-method form))])
+                   (tui-lifts-into #,prog)
+                   v))]
        [(using)
         (define p (using-path #'form))
         #`(begin (begin-for-syntax (tui-add-reference! #,p))
                  (tui-program-add-reference! #,prog #,p))]
        [(open) #`(begin-for-syntax (tui-add-open! #,(open-namespace #'form)))]
        [(passthrough) #'form]
-       [else #`(run-tui-main #,prog (tui-main/print form))])]))
+       [else #`(let ([m (tui-main/print form)])
+                 (tui-lifts-into #,prog)
+                 (run-tui-main #,prog m))])]))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Expressions
@@ -511,10 +704,26 @@
      (define-values (tys codes) (tc* (syntax->list #'(e ...))))
      (for ([ty tys] [e (syntax->list #'(e ...))])
        (when (eq? ty 'void) (raise-syntax-error 'tui "cannot bind a void value" e)))
-     (define slots (for/list ([ty tys]) (alloc-local! stx ty)))
-     (define init (append* (for/list ([c codes] [i slots]) (append c (list (var-instr 'st 'local i))))))
+     (define xs (syntax->list #'(x ...)))
+     (define captured (mctx-captured (the-mctx stx)))
+     (define cells? (for/list ([x (in-list xs)]) (hash-ref captured (syntax-e x) #f)))
+     (define slots (for/list ([ty tys] [c? cells?]) (alloc-local! stx (if c? (cell-of ty) ty))))
+     ; A cell is created each time the let runs, so each run (for example, each loop iteration)
+     ; gets a fresh variable.
+     (define init
+       (append*
+        (for/list ([c codes] [slot slots] [ty tys] [c? cells?])
+          (if c?
+              (append (new-cell-code ty)
+                      (list (var-instr 'st 'local slot)
+                            (var-instr 'ld 'local slot)
+                            '(ldc.i4.0))
+                      c
+                      (list `(stelem ,(tui-type->il ty))))
+              (append c (list (var-instr 'st 'local slot)))))))
      (define-values (ty code)
-       (tc/bind (for/list ([x (syntax->list #'(x ...))] [i slots] [t tys]) (list x 'local i t))
+       (tc/bind (for/list ([x (in-list xs)] [slot (in-list slots)] [t (in-list tys)] [c? (in-list cells?)])
+                  (list x (if c? 'cell 'local) slot t))
                 #'(tui-begin body ...)))
      (il ty (append init code))]))
 
@@ -523,8 +732,13 @@
     [(_ x:id e)
      (define v (syntax-local-value #'x (λ () #f)))
      (unless (tui-var? v) (raise-syntax-error 'tui "not a variable" #'x))
-     (il 'void (append (tc/expect #'e (tui-var-type v))
-                       (list (var-instr 'st (tui-var-kind v) (tui-var-index v)))))]))
+     (il 'void (store-var v #'x (tc/expect #'e (tui-var-type v))))]))
+
+(define-tui-form (tui-fn stx)
+  (syntax-parse stx
+    [(_ dt:id (p:id ...) body ...+)
+     (compile-lambda stx #'dt (syntax->list #'(p ...)) (syntax->list #'(body ...)))]
+    [_ (raise-syntax-error 'tui "expected (fn Delegate (param ...) body ...+)" stx)]))
 
 (define-tui-form (tui-if stx)
   (syntax-parse stx

@@ -159,3 +159,43 @@
   (tui-write-exe p pb)
   (check-equal? (file->bytes pa) (file->bytes pb))
   (delete-directory/files dir))
+
+(test-case "fn builds delegates for Action, Func and Predicate"
+  (check-equal? (run-example "delegates.rkt")
+                '("10" "20" "30" "1" "2" "42" "81" "6" "from fn" "no args")))
+
+(test-case "fn checks its delegate type and body"
+  (check-regexp-match #rx"fn has 0 parameters but .*Action<int32> takes 1"
+                      (tui-error '(fn Action<int32> () (Console.WriteLine 1))))
+  (check-regexp-match #rx"fn needs a delegate type, got System.Console"
+                      (tui-error '(fn System.Console (x) x)))
+  (check-regexp-match #rx"function returns int32 but its body has type string"
+                      (tui-error '(fn |Func<int32, int32>| (n) "s")))
+  (check-regexp-match #rx"unknown type" (tui-error '(fn Nope (x) x))))
+
+(test-case "fn captures locals and arguments by reference"
+  (check-equal? (run-example "captures.rkt")
+                '("12" "15" "101" "42" "tui" "0" "20"))
+  (check-equal? (run-tui '(define (f [k : int]) : |Func<int32, int32>|
+                            (fn |Func<int32, int32>| (n) (+ n k)))
+                         '(Console.WriteLine (.Invoke (f 4) 1)))
+                '("5"))
+  (check-equal? (run-tui '(let ([k 2])
+                            (Console.WriteLine (.Invoke (fn Func<int32> () (* k 3))))
+                            (set! k 5)
+                            (Console.WriteLine (.Invoke (fn Func<int32> () k)))))
+                '("6" "5")))
+
+(test-case "the REPL lifts lambdas defined in an interaction"
+  (define mod (build-path examples "basics.rkt"))
+  (dynamic-require mod #f)
+  (define ns (module->namespace mod))
+  (define (repl form)
+    (lines (with-output-to-string
+             (λ () (parameterize ([current-namespace ns])
+                     (eval (namespace-syntax-introduce
+                            (datum->syntax #f (cons '#%top-interaction form)))))))))
+  (check-equal? (repl '(define (mk) : |Func<int32, int32>| (fn |Func<int32, int32>| (n) (+ n 1))))
+                '())
+  (check-equal? (repl '(Console.WriteLine (.Invoke (mk) 1))) '("2")))
+
