@@ -4,6 +4,10 @@
 (require (for-syntax racket/base syntax/parse))
 (provide sum-of)
 
+
+(define-syntax-parser cwl
+  [(_ x:expr ... )#'(begin (Console.WriteLine x) ...)])
+
 ; (sum-of xs) type checks xs, then reads the element type from the metadata of its closed List<T>
 ; (the return type of get_Item). The element type picks the starting value and the expansion
 ; reuses Tui's + for the fold, which joins strings and adds ints.
@@ -27,15 +31,15 @@
 
 (let ([names (list-of "ada" "grace")])
   (.Add names "linus")
-  (Console.WriteLine (.get_Count names))
-  (Console.WriteLine (.get_Item names 2)))
+  (cwl (.get_Count names))
+  (cwl (.get_Item names 2)))
 
 (let ([xs (list-of 1 2 3)] [i 0] [total 0])
   (while (< i (.get_Count xs))
     (set! total (+ total (.get_Item xs i)))
     (set! i (+ i 1)))
-  (Console.WriteLine total))
+  (cwl total))
 
 (let ([words (list-of "pink" " squirrel " "labs")])
-(Console.WriteLine (sum-of words)))
-(Console.WriteLine (sum-of (list-of 12 6 6)))
+(cwl (sum-of words)))
+(cwl (sum-of (list-of 12 6 6)))
