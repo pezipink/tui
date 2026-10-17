@@ -58,10 +58,20 @@
    '("c")))
 
 (test-case "the list-of example runs"
-  (check-equal? (run-example "lists.rkt") '("3" "linus" "6" "pink squirrel labs" "24")))
+  (check-equal? (run-example "lists.rkt")
+                '("tui " "42" "is super" "58" " cool!!!" "3" "linus" "6" "pink squirrel labs" "24")))
 
 (test-case "default-of takes a type name and expands to its default value"
-  (check-equal? (run-example "types.rkt") '("0" "False" "0" "0" "0")))
+  (check-equal? (run-example "types.rkt")
+                '("0" "False" "0" "0" "0" "System.Collections.Generic.List<int32>")))
+
+(test-case "type-name-of expands to the Tui name of its argument's type"
+  (define types-path (path->string (build-path examples "types.rkt")))
+  (check-equal?
+   (run-tui `(require (file ,types-path))
+            '(Console.WriteLine (type-name-of 1))
+            '(Console.WriteLine (type-name-of (list-of 1 2))))
+   '("int32" "System.Collections.Generic.List<int32>")))
 
 (test-case "default-of rejects types whose default it cannot build"
   (define types-path (path->string (build-path examples "types.rkt")))

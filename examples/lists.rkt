@@ -6,14 +6,18 @@
 
 
 (define-syntax-parser cwl
-  [(_ x:expr ... )#'(begin (Console.WriteLine x) ...)])
+  [(_ x:expr ... )
+    ; each expression is typed and will resolve to the 
+    ; appropriate Console.WriteLine overload.
+    ; Try doing that in C#! 
+    #'(begin (Console.WriteLine x) ...)])
 
 ; (sum-of xs) type checks xs, then reads the element type from the metadata of its closed List<T>
 ; (the return type of get_Item). The element type picks the starting value and the expansion
 ; reuses Tui's + for the fold, which joins strings and adds ints.
 (define-syntax-parser sum-of
-  [(_ xs:expr)
-   (define elem (tui-member-return-type (tui-type-of #'xs) "get_Item"))
+  [(_ xs:typedList)
+   (define elem (attribute xs.Elem))
    (define zero
      (case elem
        [(int32) #'0]
@@ -31,6 +35,7 @@
 
 (let ([names (list-of "ada" "grace")])
   (.Add names "linus")
+  (cwl "tui " 42 "is super" 58 " cool!!!")
   (cwl (.get_Count names))
   (cwl (.get_Item names 2)))
 

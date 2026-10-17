@@ -3,11 +3,11 @@
 ; chosen from T's metadata: a literal for value types and string, or (new T) for a class with a
 ; public parameterless constructor. Any other type is a syntax error at the use site.
 (require (for-syntax racket/base syntax/parse))
-(provide default-of)
+(provide default-of type-name-of)
 
 (define-syntax-parser default-of
-  [(_ t:id)
-   (define ty (tui-resolve-type #'t))
+  [(_ t:typeName)
+   (define ty (attribute t.Type))
    (cond
      [(eq? ty 'int32) #'0]
      [(eq? ty 'bool) #'#f]
@@ -20,8 +20,14 @@
                     (tui-type->string ty))
             this-syntax)])])
 
+; (type-name-of e) expands to the Tui name of e's type, as a string literal. e is type checked but
+; not evaluated.
+(define-syntax-parser type-name-of
+  [(_ e:typedExpr) #`#,(tui-type->string (attribute e.Type))])
+
 (Console.WriteLine (default-of int32))
 (Console.WriteLine (default-of bool))
 (Console.WriteLine (.get_Length (default-of string)))
 (Console.WriteLine (.get_Length (default-of System.String)))
 (Console.WriteLine (.get_Length (default-of System.Text.StringBuilder)))
+(Console.WriteLine (type-name-of (list-of 1 2)))

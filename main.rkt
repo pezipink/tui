@@ -8,6 +8,7 @@
 (require (for-syntax racket/base racket/list racket/string syntax/parse syntax/parse/define
                      "private/clr.rkt")
          syntax/parse/define
+         (only-in syntax/parse define-syntax-class pattern)
          "private/runtime.rkt")
 
 (provide (rename-out [tui-module-begin #%module-begin]
@@ -23,7 +24,8 @@
          for-syntax file
          ... _ (for-syntax ... _)
          (for-syntax tui-type-of tui-member-return-type tui-type->string class-of
-                     tui-resolve-type tui-has-default-ctor?))
+                     tui-resolve-type tui-has-default-ctor?
+                     typedExpr typedList typeName))
 
 (module reader syntax/module-reader tui)
 
@@ -288,6 +290,28 @@
     (and (pair? t)
          (let ([groups (find-instance-methods t name)])
            (and (pair? groups) (clr-method-ret (car (car groups))))))))
+
+;; Syntax classes that give user macros the Tui types of their arguments. A pattern variable x of
+;; class typedExpr has x.Type, the type the checker gives the expression. typedList also has x.Elem,
+;; the return type of get_Item, or #f when there is none. typeName matches a type name and has
+;; x.Type, the type it names.
+; The attribute expressions run at phase 1, so the classes go in a begin-for-syntax beside the helpers.
+(begin-for-syntax
+  (define-syntax-class typedExpr
+    #:attributes (Type)
+    (pattern e
+      #:attr Type (tui-type-of #'e)))
+
+  (define-syntax-class typedList
+    #:attributes (Type Elem)
+    (pattern e
+      #:attr Type (tui-type-of #'e)
+      #:attr Elem (tui-member-return-type (attribute Type) "get_Item")))
+
+  (define-syntax-class typeName
+    #:attributes (Type)
+    (pattern t:id
+      #:attr Type (tui-resolve-type #'t))))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Module and REPL
