@@ -4,30 +4,38 @@
 (require racket/file racket/system file/sha1
          rangi/src/cli/reader rangi/src/ilasm/syntax rangi/src/image)
 (provide make-tui-program tui-program? tui-program-references tui-program-methods tui-program-main
-         tui-program-add-method! tui-program-add-reference!
+         tui-program-add-method! tui-program-add-class! tui-program-add-reference!
          tui-program->il tui-write-exe run-tui-program run-tui-main)
 
 ; references: assembly paths. methods: (name . .method datum) pairs in definition order.
-; main: the .method datum for the entry point. The REPL adds methods and references.
-(struct tui-program (references methods main) #:mutable)
+; main: the .method datum for the entry point. classes: the .class datums of the lambdas.
+; The REPL adds methods, classes, and references.
+(struct tui-program (references methods main classes) #:mutable)
 
 (define (make-tui-program references methods main)
-  (tui-program references methods main))
+  (tui-program references methods main '()))
 
 (define (tui-program-add-method! p name m)
   (define others (filter (λ (e) (not (eq? (car e) name))) (tui-program-methods p)))
   (set-tui-program-methods! p (append others (list (cons name m)))))
+
+; Each lifted class is a top-level class of the assembly. tui-program-add-class! takes its ilasm
+; datum, which is the lifted value.
+(define (tui-program-add-class! p c)
+  (set-tui-program-classes! p (append (tui-program-classes p) (list c))))
 
 (define (tui-program-add-reference! p path)
   (unless (member path (tui-program-references p))
     (set-tui-program-references! p (append (tui-program-references p) (list path)))))
 
 ; The whole program as Rangi ilasm. Every Tui function is a static method of <Module>, which
-; Rangi moves into its generated Program class.
+; Rangi moves into its generated Program class. The lambda classes are top-level siblings of
+; <Module>, since Rangi does not allow nested classes there.
 (define (tui-program->il p name [main (tui-program-main p)])
   `(,@(for/list ([r (in-list (tui-program-references p))]) `(.assembly extern ,r ,(extern-body r)))
     (.assembly ,name ())
     (.module ,(string->symbol (format "~a.exe" name)))
+    ,@(tui-program-classes p)
     (.class (private auto ansi) <Module>
             (,@(map cdr (tui-program-methods p)) ,main))))
 

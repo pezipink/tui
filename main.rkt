@@ -58,18 +58,43 @@
 (define-syntax open (top-level-only "open"))
 
 (begin-for-syntax
-  ;; Per-method state: local variable types (in slot order) and a label counter.
-  ; captured holds the names (symbols) that a fn in this body mentions. Those variables live in
-  ; one-element arrays (cells) so a lambda can share them. parent is the enclosing method of a
-  ; lambda. env lists the (variable . local) pairs that a lambda reads from its env array.
-  (struct mctx ([locals #:mutable] [labels #:mutable] captured parent [env #:mutable]))
+  ; Per-method state: local variable types (in slot order) and a label counter. parent is the
+  ; enclosing method of a lambda. env lists the (variable . local) pairs that a lambda reads from
+  ; its class fields.
+  (struct mctx ([locals #:mutable] [labels #:mutable] parent [env #:mutable]))
   (struct cell-of (type))
   (define current-mctx (make-parameter #f))
 
-  ; Lambda bodies become static methods of Program. Each (name . method) waits here until a
-  ; tui-lifts-into adds it to the program, which happens after the expansion that compiled it.
-  (define lifted-methods (box '()))
-  (define lambda-count (box 0))
+  ; Variables that a lambda reads live in one-element arrays (cells), so the lambda and its
+  ; enclosing method share them. Each top-level method is compiled in two passes (run-passes).
+  ; The discovery pass compiles with plain slots and records in used the ordinal of every variable
+  ; that a lambda reads. An ordinal numbers a variable by the order its binding is created, which
+  ; is the same in both passes. If the body has a lambda, the second pass makes those variables
+  ; cells (cells holds the ordinals from the discovery pass). Lambdas are only lifted in the
+  ; second pass.
+  (struct pass (discovering? cells used [next #:mutable] [lambdas #:mutable]))
+  (define current-pass (make-parameter #f))
+
+  (define (next-ordinal!)
+    (define p (current-pass))
+    (begin0 (pass-next p) (set-pass-next! p (add1 (pass-next p)))))
+
+  (define (cell-ordinal? ord) (hash-ref (pass-cells (current-pass)) ord #f))
+
+  ; Calls thunk, which compiles one method body and returns (values code locals-or-mctx). Returns
+  ; the result of the second pass if the body has lambdas, otherwise the result of the first.
+  (define (run-passes thunk)
+    (define d (pass #t (make-hasheqv) (make-hasheqv) 0 0))
+    (define-values (code0 r0) (parameterize ([current-pass d]) (thunk)))
+    (cond
+      [(zero? (pass-lambdas d)) (values code0 r0)]
+      [else
+       (parameterize ([current-pass (pass #f (pass-used d) (make-hasheqv) 0 0)])
+         (thunk))]))
+
+  ; Each lambda becomes a generated class. Its datum is lifted with syntax-local-lift-expression,
+  ; and the lifted identifiers wait here until tui-lifts-into adds them to the program.
+  (define lifted-classes (box '()))
 
   (define (the-mctx stx)
     (or (current-mctx) (raise-syntax-error 'tui "Tui expression outside a method body" stx)))
@@ -83,40 +108,17 @@
     (set-mctx-locals! m (append (mctx-locals m) (list ty)))
     i)
 
-  (define (new-mctx forms parent) (mctx '() 0 (captured-names forms) parent '()))
-
-  ; The names (symbols) that a fn form in forms mentions. Matching is by name, so a name can be
-  ; included when the fn does not really capture it; that only costs a cell.
-  (define (captured-names forms)
-    (define found (make-hasheq))
-    (define (mark! e)
-      (cond
-        [(identifier? e) (hash-set! found (syntax-e e) #t)]
-        [(syntax? e) (mark! (syntax-e e))]
-        [(pair? e) (mark! (car e)) (mark! (cdr e))]
-        [else (void)]))
-    (define (fn-form? e)
-      (and (identifier? (car e)) (free-identifier=? (car e) #'tui-fn)))
-    (define (scan e)
-      (cond
-        [(syntax? e) (scan (syntax-e e))]
-        [(pair? e) (if (fn-form? e) (mark! (cdr e)) (scan-list e))]
-        [else (void)]))
-    (define (scan-list l)
-      (cond
-        [(pair? l) (scan (car l)) (scan-list (cdr l))]
-        [(syntax? l) (scan-list (syntax-e l))]
-        [else (void)]))
-    (scan-list forms)
-    found)
+  (define (new-mctx parent) (mctx '() 0 parent '()))
 
   (define (fresh-label! stx base)
     (define m (the-mctx stx))
     (set-mctx-labels! m (add1 (mctx-labels m)))
     (string->symbol (format "~a~a" base (mctx-labels m))))
 
+  ; The type is also stamped on the form as the 'tui-type syntax property, so it can be read
+  ; from an expansion without unpacking the payload.
   (define (il ty instrs)
-    #`(tui-il #,(datum->syntax #f (list ty instrs))))
+    (syntax-property #`(tui-il #,(datum->syntax #f (list ty instrs))) 'tui-type ty))
 
   ; Expands stx to a typed fragment: (values type instructions).
   (define (tc stx [ctx #f])
@@ -124,12 +126,14 @@
     (syntax-case e ()
       [(head payload)
        (and (identifier? #'head) (free-identifier=? #'head #'tui-il))
-       (let ([p (syntax->datum #'payload)]) (values (car p) (cadr p)))]
+       (let ([p (syntax->datum #'payload)])
+         (values (or (syntax-property e 'tui-type) (error 'tui "internal: untyped fragment"))
+                 (cadr p)))]
       [_ (raise-syntax-error 'tui "not a Tui expression" stx)]))
 
   ; Expands stx and converts it to type `to`, or raises a type error at stx.
   (define (tc/expect stx to)
-    (define-values (ty code) (tc stx))
+    (define-values (ty code) (tc (syntax-property stx 'tui-expected to)))
     (define c (coercion ty to))
     (unless c
       (raise-syntax-error 'tui (format "type mismatch: expected ~a, got ~a"
@@ -145,25 +149,32 @@
   ; a lambda body (its own method) cannot reach the enclosing method's slots.
   ; kind is 'arg, 'local (a plain slot of owner's method) or 'cell (index is the local of owner
   ; that holds the cell array; the variable's value is element 0).
-  (struct tui-var (kind index type owner)
+  (struct tui-var (kind index type owner ord)
     #:property prop:procedure
     (λ (self stx)
       (cond
         [(not (identifier? stx)) (raise-syntax-error 'tui "a variable cannot be called" stx)]
         [else (il (tui-var-type self) (load-var self stx))])))
 
-  (define (make-tui-var kind index type) (tui-var kind index type (current-mctx)))
+  (define (make-tui-var kind index type ord) (tui-var kind index type (current-mctx) ord))
 
+  ; The slot of v in m. In the discovery pass a lambda may read v through a plain slot; the read
+  ; is recorded and the code is thrown away, so index 0 is returned. The second pass has made v a
+  ; cell in that case, so a plain slot from another method cannot happen there.
   (define (plain-slot v m stx)
-    (unless (eq? (tui-var-owner v) m)
-      (raise-syntax-error 'tui
-                          (format "a lambda can only capture ~a if its enclosing method names it in a fn form"
-                                  (syntax-e stx))
-                          stx))
-    (tui-var-index v))
+    (cond
+      [(eq? (tui-var-owner v) m) (tui-var-index v)]
+      [(pass-discovering? (current-pass))
+       (hash-set! (pass-used (current-pass)) (tui-var-ord v) #t)
+       0]
+      [else (error 'tui "internal: ~a is read from a lambda but was not made a cell" (syntax-e stx))]))
 
-  ; The local of m that holds v's cell. A lambda reads the cells it uses from its env array, and
-  ; a lambda inside a lambda gets them from its parent, so each level adds what it needs.
+  ; The field of a lambda's class that holds its k-th env cell, and that field's type.
+  (define (env-field k) (string->symbol (format "cap~a" k)))
+  (define (env-field-type v) `(szarray ,(tui-type->il (tui-var-type v))))
+
+  ; The local of m that holds v's cell. A lambda reads the cells it uses from its class fields,
+  ; and a lambda inside a lambda gets them from its parent, so each level adds what it needs.
   (define (cell-slot-in m v)
     (cond
       [(eq? (tui-var-owner v) m) (tui-var-index v)]
@@ -202,13 +213,13 @@
       [(< i 256) (list (string->symbol (string-append base ".s")) i)]
       [else (list (string->symbol base) i)]))
 
-  ; Binds each (id kind index type) in a fresh definition context, then type checks body there.
+  ; Binds each (id kind index type ordinal) in a fresh definition context, then type checks body there.
   (define (tc/bind binds body)
     (define ctx (syntax-local-make-definition-context))
     (for ([b (in-list binds)])
       (syntax-local-bind-syntaxes
        (list (internal-definition-context-introduce ctx (car b) 'add))
-       #`(make-tui-var '#,(cadr b) #,(caddr b) '#,(cadddr b))
+       #`(make-tui-var '#,(cadr b) #,(caddr b) '#,(cadddr b) '#,(list-ref b 4))
        ctx))
     (tc (internal-definition-context-introduce ctx body 'add) ctx))
 
@@ -264,11 +275,12 @@
       [_ (raise-syntax-error 'tui "expected (define (name [param : type] ...) : type body ...+)"
                              def)]))
 
-  ; Compiles one method body. binds are (id kind index type) and parent is the enclosing method of
-  ; a lambda (#f for a method). Returns the instructions, with the return conversion and ret, and
-  ; the mctx that holds the locals and the lambda's env.
-  (define (compile-body stx binds body rty parent)
-    (define m (new-mctx body parent))
+  ; Compiles one method body. binds are (id kind index type), parent is the enclosing method of
+  ; a lambda (#f for a method), and owner is the lambda's class (#f for a method). Returns the
+  ; instructions, with the return conversion and ret, and the mctx that holds the locals and the
+  ; lambda's env.
+  (define (compile-body stx binds body rty parent owner)
+    (define m (new-mctx parent))
     (parameterize ([current-mctx m])
       ; A captured argument is copied into a cell, so the lambda and its enclosing method share it.
       (define-values (cell-binds arg-code)
@@ -278,10 +290,11 @@
           (define kind (cadr b))
           (define index (caddr b))
           (define ty (cadddr b))
+          (define ord (next-ordinal!))
           (cond
-            [(and (eq? kind 'arg) (hash-ref (mctx-captured m) (syntax-e id) #f))
+            [(and (eq? kind 'arg) (cell-ordinal? ord))
              (define j (alloc-local-in! m (cell-of ty)))
-             (values (cons (list id 'cell j ty) bs)
+             (values (cons (list id 'cell j ty ord) bs)
                      (cons (append (new-cell-code ty)
                                    (list (var-instr 'st 'local j)
                                          (var-instr 'ld 'local j)
@@ -289,8 +302,12 @@
                                          (var-instr 'ld 'arg index)
                                          `(stelem ,(tui-type->il ty))))
                            code))]
-            [else (values (cons b bs) code)])))
-      (define-values (bty code) (tc/bind cell-binds #`(tui-begin #,@body)))
+            [else (values (cons (append b (list ord)) bs) code)])))
+      (define n (length body))
+      (define tail-body
+        (for/list ([b (in-list body)] [i (in-naturals 1)])
+          (if (and (= i n) (not (eq? rty 'void))) (syntax-property b 'tui-expected rty) b)))
+      (define-values (bty code) (tc/bind cell-binds #`(tui-begin #,@tail-body)))
       (define ret-code
         (cond
           [(eq? rty 'void) (if (eq? bty 'void) '() '((pop)))]
@@ -298,14 +315,11 @@
           [else (raise-syntax-error 'tui (format "function returns ~a but its body has type ~a"
                                                  (tui-type->string rty) (tui-type->string bty))
                                     stx)]))
-      ; Copies the env entries that this lambda reads into locals (the env is argument 0).
+      ; Copies the cells that this lambda reads from its fields into locals (this is argument 0).
       (define env-code
         (append* (for/list ([e (in-list (mctx-env m))] [k (in-naturals)])
-                   (define T (tui-type->il (tui-var-type (car e))))
                    (list '(ldarg.0)
-                         `(ldc.i4 ,k)
-                         '(ldelem object)
-                         `(castclass (szarray ,T))
+                         `(ldfld ,owner ,(env-field k) ,(env-field-type (car e)))
                          (var-instr 'st 'local (cdr e))))))
       (values (append env-code arg-code code ret-code '((ret))) m)))
 
@@ -320,11 +334,13 @@
     (define ptys (map ann->type ptypes))
     (define rty (ann->type ret))
     (define-values (code m)
-      (compile-body def (for/list ([p pnames] [t ptys] [i (in-naturals)]) (list p 'arg i t))
-                    body rty #f))
-    `(.method (public static) ,(tui-type->il rty) ,(syntax-e name) ,(map tui-type->il ptys)
-              (cil managed)
-              (,@(locals-decl (mctx-locals m)) ,@code)))
+      (run-passes
+       (λ ()
+         (compile-body def (for/list ([p pnames] [t ptys] [i (in-naturals)]) (list p 'arg i t))
+                       body rty #f #f))))
+      `(.method (public static) ,(tui-type->il rty) ,(syntax-e name) ,(map tui-type->il ptys)
+                (cil managed)
+                (,@(locals-decl (mctx-locals m)) ,@code)))
 
   ; Whether the class type t derives from System.MulticastDelegate.
   (define (delegate-type? t)
@@ -332,76 +348,91 @@
       (and b (or (and (equal? (caddr b) "System") (equal? (cadddr b) "MulticastDelegate"))
                  (loop (base-type b))))))
 
-  ; The delegate type named by a fn form, and the parameter and return types of its Invoke.
-  (define (delegate-signature stx dt-id)
-    (define t (ann->type dt-id))
+  ; The parameter and return types of the Invoke method of delegate type t.
+  (define (delegate-signature stx t)
     (unless (delegate-type? t)
       (raise-syntax-error 'tui (format "fn needs a delegate type, got ~a" (tui-type->string t))
-                          dt-id))
+                          stx))
     (define groups (with-clr stx (λ () (find-instance-methods t "Invoke"))))
     (unless (pair? groups)
-      (raise-syntax-error 'tui "delegate has no Invoke method" dt-id))
+      (raise-syntax-error 'tui "delegate has no Invoke method" stx))
     (define m (car (car groups)))
-    (values t (clr-method-params m) (clr-method-ret m)))
+    (values (clr-method-params m) (clr-method-ret m)))
 
-  ; (fn Delegate (param ...) body ...+). The body is a static method of Program that takes the env
-  ; array as its first argument. The value is a delegate over that env, so a lambda reads its
-  ; captured cells from it.
-  (define (compile-lambda stx dt-id pnames body)
-    (define-values (dt ptys rty) (delegate-signature stx dt-id))
+  ; (fn Delegate (param ...) body ...+). The body is the Invoke method of a generated class. The
+  ; class has one field per cell that the body reads, and an instance of it is the delegate's
+  ; target. dt is the delegate type.
+  (define (compile-lambda stx dt pnames body)
+    (define-values (ptys rty) (delegate-signature stx dt))
     (unless (= (length pnames) (length ptys))
       (raise-syntax-error 'tui (format "fn has ~a parameters but ~a takes ~a"
                                        (length pnames) (tui-type->string dt) (length ptys))
                           stx))
     (define parent (current-mctx))
+    (define cname (string->symbol (symbol->string (gensym 'closure))))
+    (set-pass-lambdas! (current-pass) (add1 (pass-lambdas (current-pass))))
     (define-values (code m)
       (compile-body stx (for/list ([p pnames] [t ptys] [i (in-naturals 1)]) (list p 'arg i t))
-                    body rty parent))
-    (define env (mctx-env m))
-    (define n (unbox lambda-count))
-    (set-box! lambda-count (add1 n))
-    (define name (string->symbol (format "__lambda~a" n)))
-    (define params (cons '(szarray object) (map tui-type->il ptys)))
-    (define method
-      `(.method (public static) ,(tui-type->il rty) ,name ,params
-                (cil managed)
-                (,@(locals-decl (mctx-locals m)) ,@code)))
-    (set-box! lifted-methods (cons (cons name method) (unbox lifted-methods)))
-    (define env-build
-      (append* (for/list ([e (in-list env)] [k (in-naturals)])
-                 (list '(dup)
-                       `(ldc.i4 ,k)
-                       (var-instr 'ld 'local (cell-slot-in parent (car e)))
-                       '(stelem object)))))
-    (il dt `((ldc.i4 ,(length env))
-             (newarr object)
-             ,@env-build
-             (ldftn ,(tui-type->il rty) (Program) ,name ,params)
-             (newobj ,(owner->il dt) (object intptr)))))
+                    body rty parent cname))
+    (if (pass-discovering? (current-pass))
+        (il dt '((ldnull)))
+        (let ()
+          (define env (mctx-env m))
+          (define ils (map tui-type->il ptys))
+          (define ret-il (tui-type->il rty))
+          (define fields
+            (for/list ([e (in-list env)] [k (in-naturals)])
+              `(.field (public) ,(env-field-type (car e)) ,(env-field k))))
+          (define ctor
+            '(.method (public specialname rtspecialname) void .ctor () (cil managed)
+                      ((ldarg.0) (call void (mscorlib System.Object) .ctor ()) (ret))))
+          (define invoke
+            `(.method (public) ,ret-il Invoke ,ils (cil managed)
+                      (,@(locals-decl (mctx-locals m)) ,@code)))
+          (define class-datum `(.class (public auto ansi) ,cname (,@fields ,ctor ,invoke)))
+          (set-box! lifted-classes
+                    (cons (syntax-local-lift-expression
+                           #`(#,(quote-syntax quote) #,(datum->syntax #f class-datum)))
+                          (unbox lifted-classes)))
+          (define env-build
+            (append* (for/list ([e (in-list env)] [k (in-naturals)])
+                       (list '(dup)
+                             (var-instr 'ld 'local (cell-slot-in parent (car e)))
+                             `(stfld ,cname ,(env-field k) ,(env-field-type (car e)))))))
+          (il dt `((newobj (,cname) ())
+                   ,@env-build
+                   (ldftn ,ret-il (,cname) Invoke ,ils)
+                   (newobj ,(owner->il dt) (object intptr)))))))
+
 
   ; The entry point. With print? the value of the last form, if any, is written to the console.
   (define (compile-main stx forms print?)
     (define-values (code locals)
-      (parameterize ([current-mctx (new-mctx forms #f)])
-        (define-values (ty code) (tc/bind '() #`(tui-begin #,@forms)))
-        (define tail
-          (cond
-            [(eq? ty 'void) '()]
-            [print? (let-values ([(m convs) (with-clr stx
-                                              (λ () (resolve-overload
-                                                     (list (find-static-methods "System.Console"
-                                                                                "WriteLine"))
-                                                     (list ty) "Console.WriteLine")))])
-                      (append (car convs) (list (clr-call-instr 'call m))))]
-            [else '((pop))]))
-        (values (append code tail '((ret))) (mctx-locals (current-mctx)))))
+      (run-passes
+       (λ ()
+         (parameterize ([current-mctx (new-mctx #f)])
+           (define-values (ty code) (tc/bind '() #`(tui-begin #,@forms)))
+           (define tail
+             (cond
+               [(eq? ty 'void) '()]
+               [print? (let-values ([(m convs) (with-clr stx
+                                                 (λ () (resolve-overload
+                                                        (list (find-static-methods "System.Console"
+                                                                                   "WriteLine"))
+                                                        (list ty) "Console.WriteLine")))])
+                         (append (car convs) (list (clr-call-instr 'call m))))]
+               [else '((pop))]))
+           (values (append code tail '((ret))) (mctx-locals (current-mctx)))))))
     `(.method (public static) void __tui_main () (cil managed)
               ((.entrypoint) ,@(locals-decl locals) ,@code)))
 
   (define (clr-call-instr op m)
     `(,op ,@(if (clr-method-static? m) '() '(instance))
           ,(clr-method-il-ret m) ,(owner->il (clr-method-owner m))
-          ,(string->symbol (clr-method-name m)) ,(clr-method-il-params m)))
+          ,(string->symbol (clr-method-name m)) ,(clr-method-il-params m)
+          ,@(if (null? (clr-method-targs m))
+                '()
+                `((inst ,@(map tui-type->il (clr-method-targs m)))))))
 
   ;; Module-level form classification, shared by #%module-begin and #%top-interaction.
   (define (form-kind f)
@@ -457,7 +488,8 @@
   (define (tui-member-return-type t name)
     (and (pair? t)
          (let ([groups (find-instance-methods t name)])
-           (and (pair? groups) (clr-method-ret (car (car groups))))))))
+           (for*/first ([g (in-list groups)] [m (in-list g)] #:when (zero? (clr-method-arity m)))
+             (clr-method-ret m))))))
 
 ;; Syntax classes that give user macros the Tui types of their arguments. A pattern variable x of
 ;; class typedExpr has x.Type, the type the checker gives the expression. typedList also has x.Elem,
@@ -492,8 +524,7 @@
      (define refs (cons mscorlib-path (map using-path (of 'using))))
      (define opens (cons "System" (map open-namespace (of 'open))))
      (tui-configure! refs opens)
-     (set-box! lifted-methods '())
-     (set-box! lambda-count 0)
+     (set-box! lifted-classes '())
      (define defs (of 'define))
      (with-syntax ([prog (datum->syntax stx '%tui-program)]
                    [(decl ...) (map fun-declaration defs)]
@@ -517,16 +548,15 @@
 (define-syntax (tui-reference-list stx)
   #`(quote #,(tui-references)))
 
-; Adds the lambda bodies compiled so far to p. Use it only in a let body that follows the
+; Adds the lambda classes compiled so far to p. Use it only in a let body that follows the
 ; expression which compiled them (see tui-lifting), so the expansion order is right.
 (define-syntax (tui-lifts-into stx)
   (syntax-case stx ()
     [(_ p)
-     (let ([ms (reverse (unbox lifted-methods))])
-       (set-box! lifted-methods '())
-       (with-syntax ([(add ...) (for/list ([m (in-list ms)])
-                                  #`(tui-program-add-method! p '#,(car m)
-                                                             (quote #,(datum->syntax #f (cdr m)))))])
+     (let ([ids (reverse (unbox lifted-classes))])
+       (set-box! lifted-classes '())
+       (with-syntax ([(add ...) (for/list ([id (in-list ids)])
+                                  #`(tui-program-add-class! p #,id))])
          #'(begin (void) add ...)))]))
 
 ; The value of e, after the lambda bodies that e compiled are added to it.
@@ -552,7 +582,7 @@
   (syntax-parse stx
     [(_ . form)
      (define prog (datum->syntax stx '%tui-program))
-     (set-box! lifted-methods '())
+     (set-box! lifted-classes '())
      (case (form-kind #'form)
        [(define)
         (define-values (name p t r b) (fun-header #'form))
@@ -597,18 +627,27 @@
 (define-tui-form (tui-app stx)
   (syntax-parse stx
     [(_ head:id arg ...)
-     (define name (symbol->string (syntax-e #'head)))
+     (define full (symbol->string (syntax-e #'head)))
+     (define targs-text (regexp-match #rx"^(.*)<(.*)>$" full))
+     (define name (if targs-text (cadr targs-text) full))
+     (define explicit (if targs-text (explicit-targs #'head (caddr targs-text)) '()))
      (define args (syntax->list #'(arg ...)))
      (cond
        [(regexp-match #rx"^\\.([^.]+)$" name)
-        => (λ (m) (compile-instance-call stx #'head (cadr m) args))]
+        => (λ (m) (compile-instance-call stx #'head (cadr m) args explicit))]
        [(regexp-match #rx"^(.+)\\.([^.]+)$" name)
-        => (λ (m) (compile-static-call stx #'head (cadr m) (caddr m) args))]
+        => (λ (m) (compile-static-call stx #'head (cadr m) (caddr m) args explicit))]
        [else (raise-syntax-error 'tui "unbound function" #'head)])]
     [(_ head . _) (raise-syntax-error 'tui "only named functions can be called" stx #'head)]))
 
 (begin-for-syntax
-  (define (compile-static-call stx head type-name method-name args)
+  ; The explicit type arguments of a call, as in Enumerable.Where<int32>.
+  (define (explicit-targs head text)
+    (for/list ([s (in-list (split-type-args text))])
+      (or (with-clr head (λ () (string->tui-type s)))
+          (raise-syntax-error 'tui (format "unknown type argument ~a" s) head))))
+
+  (define (compile-static-call stx head type-name method-name args explicit)
     (define-values (tys codes) (tc* args))
     (define ms (with-clr head (λ () (find-static-methods type-name method-name))))
     (unless ms (raise-syntax-error 'tui (format "unknown type ~a" type-name) head))
@@ -617,11 +656,11 @@
                           head))
     (define-values (m convs)
       (with-clr stx (λ () (resolve-overload (list ms) tys
-                                            (format "~a.~a" type-name method-name)))))
+                                            (format "~a.~a" type-name method-name) explicit))))
     (il (clr-method-ret m) (append (args-code codes convs) (list (clr-call-instr 'call m)))))
 
   ; A value-type receiver is boxed and dispatched through System.Object (ToString and friends).
-  (define (compile-instance-call stx head method-name args)
+  (define (compile-instance-call stx head method-name args explicit)
     (when (null? args)
       (raise-syntax-error 'tui (format ".~a needs a receiver" method-name) stx))
     (define-values (rty rcode) (tc (car args)))
@@ -638,7 +677,8 @@
                           head))
     (define-values (m convs)
       (with-clr stx (λ () (resolve-overload groups tys
-                                            (format "~a.~a" (tui-type->string owner) method-name)))))
+                                            (format "~a.~a" (tui-type->string owner) method-name)
+                                            explicit))))
     (il (clr-method-ret m)
         (append recv-code (args-code codes convs) (list (clr-call-instr 'callvirt m))))))
 
@@ -705,8 +745,8 @@
      (for ([ty tys] [e (syntax->list #'(e ...))])
        (when (eq? ty 'void) (raise-syntax-error 'tui "cannot bind a void value" e)))
      (define xs (syntax->list #'(x ...)))
-     (define captured (mctx-captured (the-mctx stx)))
-     (define cells? (for/list ([x (in-list xs)]) (hash-ref captured (syntax-e x) #f)))
+     (define ords (for/list ([x (in-list xs)]) (next-ordinal!)))
+     (define cells? (for/list ([ord (in-list ords)]) (cell-ordinal? ord)))
      (define slots (for/list ([ty tys] [c? cells?]) (alloc-local! stx (if c? (cell-of ty) ty))))
      ; A cell is created each time the let runs, so each run (for example, each loop iteration)
      ; gets a fresh variable.
@@ -722,8 +762,9 @@
                       (list `(stelem ,(tui-type->il ty))))
               (append c (list (var-instr 'st 'local slot)))))))
      (define-values (ty code)
-       (tc/bind (for/list ([x (in-list xs)] [slot (in-list slots)] [t (in-list tys)] [c? (in-list cells?)])
-                  (list x (if c? 'cell 'local) slot t))
+       (tc/bind (for/list ([x (in-list xs)] [slot (in-list slots)] [t (in-list tys)]
+                           [c? (in-list cells?)] [ord (in-list ords)])
+                  (list x (if c? 'cell 'local) slot t ord))
                 #'(tui-begin body ...)))
      (il ty (append init code))]))
 
@@ -734,11 +775,18 @@
      (unless (tui-var? v) (raise-syntax-error 'tui "not a variable" #'x))
      (il 'void (store-var v #'x (tc/expect #'e (tui-var-type v))))]))
 
+; (fn Delegate (param ...) body ...+), or (fn (param ...) body ...+) when the expected type of the
+; form (set by tc/expect as 'tui-expected) is the delegate type.
 (define-tui-form (tui-fn stx)
   (syntax-parse stx
     [(_ dt:id (p:id ...) body ...+)
-     (compile-lambda stx #'dt (syntax->list #'(p ...)) (syntax->list #'(body ...)))]
-    [_ (raise-syntax-error 'tui "expected (fn Delegate (param ...) body ...+)" stx)]))
+     (compile-lambda stx (ann->type #'dt) (syntax->list #'(p ...)) (syntax->list #'(body ...)))]
+    [(_ (p:id ...) body ...+)
+     (define expected (syntax-property stx 'tui-expected))
+     (unless expected
+       (raise-syntax-error 'tui "fn without a delegate type needs an expected delegate type" stx))
+     (compile-lambda stx expected (syntax->list #'(p ...)) (syntax->list #'(body ...)))]
+    [_ (raise-syntax-error 'tui "expected (fn [Delegate] (param ...) body ...+)" stx)]))
 
 (define-tui-form (tui-if stx)
   (syntax-parse stx

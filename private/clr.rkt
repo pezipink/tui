@@ -12,8 +12,8 @@
                   first-match-policy env-type [resolve-type-name find-type-name]))
 (provide reference-assemblies-dir mscorlib-path
          tui-configure! tui-add-reference! tui-add-open! tui-references
-         resolve-type-name generic-instance class-of tui-type->il tui-type->string value-type?
-         numeric-type? coercion
+         resolve-type-name generic-instance string->tui-type split-type-args class-of tui-type->il
+         tui-type->string value-type? numeric-type? coercion
          (struct-out clr-method) find-static-methods find-instance-methods find-constructors
          resolve-overload owner->il base-type)
 
@@ -85,6 +85,18 @@
 
 ; The reference a Tui primitive names, or #f for void.
 (define (tui-prim-ref t) (primitive-ref (if (eq? t 'bool) 'boolean t)))
+
+; A signature reference as a Tui type, where a method type parameter !!n is (mvar n). A call fixes
+; these from its type arguments (see instantiate-method). Other references are as ref->tui.
+(define (sig->tui r)
+  (cond
+    [(type-param? r)
+     (and (eq? (type-param-owner r) 'method) (list 'mvar (type-param-index r)))]
+    [(and (type-ref? r) (eq? (type-ref-kind r) 'class) (pair? (type-ref-args r)))
+     (define args (map sig->tui (type-ref-args r)))
+     (and (andmap values args)
+          (list 'class (type-ref-asm r) (type-ref-namespace r) (type-ref-name r) args))]
+    [else (ref->tui r)]))
 
 ; A reference as a Tui type, or #f when Tui does not model it (other valuetypes, arrays, pointers,
 ; byrefs and type parameters).
@@ -219,10 +231,12 @@
 ;; Methods
 
 ; owner is a (class ...) Tui type (string and object are mapped back to System.String/Object).
-; params and ret are the substituted Tui types, used for typing. il-params and il-ret are the
-; signature the call names: the declaring generic definition's types, so a type parameter stays
-; !n. A MemberRef on a generic instance is matched against the definition (II.22.25).
-(struct clr-method (owner name static? params ret il-params il-ret) #:transparent)
+; arity is the number of the method's own type parameters, and params, ret name them as (mvar n).
+; targs is the list of type arguments of a closed generic method, or '() otherwise. il-params and
+; il-ret are the signature the call names: the declaring generic definition's types, so a type
+; parameter stays !n and a method's stays !!n. A MemberRef on a generic instance is matched against
+; the definition (II.22.25).
+(struct clr-method (owner name static? arity params ret il-params il-ret targs) #:transparent)
 
 (define (class-of t)
   (case t
@@ -236,8 +250,9 @@
   (and r (env-type (the-env) r)))
 
 
-; All public methods of a class type, as clr-methods. Generic methods, vararg methods, and methods
-; whose signatures name types Tui does not model are left out. The open descriptor gives the
+; All public methods of a class type, as clr-methods. Vararg methods, and methods whose signatures
+; name types Tui does not model, are left out. A generic method keeps its arity, and its method
+; type parameters are (mvar n) until a call instantiates them. The open descriptor gives the
 ; definition's signature, in the same order as the closed one.
 (define (type-methods t)
   (define d (class-desc t))
@@ -250,27 +265,29 @@
            (env-type (the-env) (with-args (type-desc-ref d) '()))))
      (for*/list ([(m o) (in-parallel (force (type-desc-methods d)) (force (type-desc-methods open)))]
                  #:when (method-desc-public? m)
-                 #:when (zero? (method-desc-arity m))
                  #:unless (method-desc-vararg? m)
-                 [params (in-value (map ref->tui (method-desc-params m)))]
+                 [params (in-value (map sig->tui (method-desc-params m)))]
                  [ret (in-value (if (eq? (method-desc-ret m) 'void)
                                     'void
-                                    (ref->tui (method-desc-ret m))))]
+                                    (sig->tui (method-desc-ret m))))]
                  [il-params (in-value (map open-il (method-desc-params o)))]
                  [il-ret (in-value (if (eq? (method-desc-ret o) 'void)
                                        'void
                                        (open-il (method-desc-ret o))))]
                  #:when (and ret (andmap values params) il-ret (andmap values il-params)))
-       (clr-method t (method-desc-name m) (method-desc-static? m) params ret il-params il-ret))]))
+       (clr-method t (method-desc-name m) (method-desc-static? m) (method-desc-arity m)
+                   params ret il-params il-ret '()))]))
 
 ; A canonical type from an open descriptor, as an ilasm type. A type parameter of the owner is
-; !n (II.23.2.12 VAR). A generic class instance keeps its open arguments. Other constructed types
-; are not modelled, so they give #f.
+; !n (II.23.2.12 VAR) and a method's is !!n (MVAR). A generic class instance keeps its open
+; arguments. Other constructed types are not modelled, so they give #f.
 (define (open-il t)
   (cond
     [(type-param? t)
-     (and (eq? (type-param-owner t) 'type)
-          (string->symbol (format "!~a" (type-param-index t))))]
+     (case (type-param-owner t)
+       [(type) (string->symbol (format "!~a" (type-param-index t)))]
+       [(method) (string->symbol (format "!!~a" (type-param-index t)))]
+       [else #f])]
     [(not (has-type-param? t)) (let ([tui (ref->tui t)]) (and tui (tui-type->il tui)))]
     [(and (type-ref? t) (eq? (type-ref-kind t) 'class))
      (define args (map open-il (type-ref-args t)))
@@ -316,29 +333,80 @@
   (filter (λ (m) (and (not (clr-method-static? m)) (equal? (clr-method-name m) ".ctor")))
           (type-methods t)))
 
+; The type arguments of a generic method call, or #f when they cannot be fixed. Explicit ones are
+; used as given. Otherwise a parameter that is exactly !!n takes the type of its argument, and every
+; !!n must be fixed that way with one type. Other parameters are checked by coercion once closed.
+(define (infer-targs m arg-types explicit)
+  (define k (clr-method-arity m))
+  (cond
+    [(pair? explicit) (and (= (length explicit) k) explicit)]
+    [else
+     (define slots (make-vector k #f))
+     (define consistent?
+       (for/and ([p (in-list (clr-method-params m))] [a (in-list arg-types)])
+         (cond
+           [(and (pair? p) (eq? (car p) 'mvar))
+            (define i (cadr p))
+            (cond [(not (vector-ref slots i)) (vector-set! slots i a) #t]
+                  [else (equal? (vector-ref slots i) a)])]
+           [else #t])))
+     (and consistent? (andmap values (vector->list slots)) (vector->list slots))]))
+
+; The closed method at type arguments targs: each (mvar n) becomes the nth argument.
+(define (instantiate-method m targs)
+  (define (subst t)
+    (cond
+      [(and (pair? t) (eq? (car t) 'mvar)) (list-ref targs (cadr t))]
+      [(and (pair? t) (eq? (car t) 'class))
+       (list 'class (cadr t) (caddr t) (cadddr t) (map subst (class-args t)))]
+      [else t]))
+  (struct-copy clr-method m
+               [params (map subst (clr-method-params m))]
+               [ret (subst (clr-method-ret m))]
+               [targs targs]))
+
 ; Picks the cheapest applicable overload. groups is a list of candidate lists; earlier groups win
-; ties with later ones (a derived type's method hides its base's). Returns
-; (values method per-argument-conversion-instructions) or raises with a description.
-(define (resolve-overload groups arg-types describe)
+; ties with later ones (a derived type's method hides its base's). explicit is the list of type
+; arguments the call names, if any. Returns (values method per-argument-conversion-instructions),
+; where method is closed, or raises with a description.
+(define (resolve-overload groups arg-types describe [explicit '()])
+  (define (close m)
+    (cond
+      [(zero? (clr-method-arity m)) (and (null? explicit) m)]
+      [(infer-targs m arg-types explicit) => (λ (targs) (instantiate-method m targs))]
+      [else #f]))
   (define (score m)
-    (and (= (length (clr-method-params m)) (length arg-types))
-         (let ([cs (map coercion arg-types (clr-method-params m))])
+    (define c (close m))
+    (and c (= (length (clr-method-params c)) (length arg-types))
+         (let ([cs (map coercion arg-types (clr-method-params c))])
            (and (andmap values cs)
-                (cons (apply + (map car cs)) (map cdr cs))))))
+                (list (apply + (map car cs)) c (map cdr cs))))))
   (let loop ([groups groups])
     (cond
       [(null? groups)
        (error 'tui "no overload of ~a accepts (~a)" describe
               (string-join (map tui-type->string arg-types) " "))]
       [else
-       (define scored (for*/list ([m (in-list (car groups))] [s (in-value (score m))] #:when s)
-                        (cons m s)))
+       (define scored (for*/list ([m (in-list (car groups))] [s (in-value (score m))] #:when s) s))
        (cond
          [(null? scored) (loop (cdr groups))]
          [else
-          (define best (apply min (map cadr scored)))
-          (define winners (filter (λ (x) (= (cadr x) best)) scored))
+          (define best (apply min (map car scored)))
+          (define winners (filter (λ (x) (= (car x) best)) scored))
           (when (> (length winners) 1)
             (error 'tui "ambiguous call to ~a with (~a)" describe
                    (string-join (map tui-type->string arg-types) " ")))
-          (values (car (car winners)) (cddr (car winners)))])])))
+          (values (cadr (car winners)) (caddr (car winners)))])])))
+
+; A type named in source text, as the type arguments of a call name it: a primitive alias, a
+; dotted class name, or a generic instance such as "System.Collections.Generic.List<int32>".
+; Returns the Tui type or #f.
+(define (string->tui-type s)
+  (define t (string-trim s))
+  (cond
+    [(assq (string->symbol t) primitive-aliases) => cdr]
+    [(regexp-match #rx"^([^<]+)<(.*)>$" t)
+     => (λ (m)
+          (define args (map string->tui-type (split-type-args (caddr m))))
+          (and (andmap values args) (generic-instance (string-trim (cadr m)) args)))]
+    [else (resolve-clr-type-name t)]))

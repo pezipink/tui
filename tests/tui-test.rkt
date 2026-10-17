@@ -34,6 +34,23 @@
   (check-equal? (list-tail out 15)
                 '("ababab" "one is not two" "github.com" "/pezipink/rangi")))
 
+(test-case "generic methods infer type arguments from argument types or take explicit ones"
+  (check-equal?
+   (run-tui '(let ([t (System.Tuple.Create 1 "a")])
+               (Console.WriteLine (.get_Item1 t))
+               (Console.WriteLine (.get_Item2 t))))
+   '("1" "a"))
+  (check-equal?
+   (run-tui '(let ([t (|System.Tuple.Create<int, string>| 2 "b")])
+               (Console.WriteLine (.get_Item1 t))))
+   '("2"))
+  (check-equal?
+   (run-tui '(Console.WriteLine (.get_Length (System.Activator.CreateInstance<System.Text.StringBuilder>))))
+   '("0"))
+  (check-true
+   (regexp-match? #rx"no overload"
+                  (tui-error '(System.Tuple.Create<int> 1 2)))))
+
 (test-case "generic instances call members on the open signature"
   (check-equal?
    (run-tui '(let ([l (new System.Collections.Generic.List<int>)])
@@ -186,6 +203,41 @@
                             (Console.WriteLine (.Invoke (fn Func<int32> () k)))))
                 '("6" "5")))
 
+(test-case "fn without a delegate name takes the expected delegate type"
+  (check-equal? (run-tui '(define (sq) : |Func<int32, int32>| (fn (n) (* n n)))
+                         '(Console.WriteLine (.Invoke (sq) 9)))
+                '("81"))
+  (check-regexp-match #rx"needs an expected delegate type"
+                      (tui-error '(let ([f (fn (n) n)]) f))))
+
+(test-case "lambdas nest and share mutable captures through their generated classes"
+  (check-equal? (run-tui '(define (outer [a : int]) : |Func<int32, int32>|
+                            (let ([b 10])
+                              (fn |Func<int32, int32>| (x)
+                                (.Invoke (fn Func<int32> () (+ a (+ b x)))))))
+                         '(Console.WriteLine (.Invoke (outer 1) 100)))
+                '("111"))
+  (check-equal? (run-tui '(let ([c 0])
+                            (let ([bump (fn Action () (set! c (+ c 1)))])
+                              (.Invoke bump)
+                              (.Invoke bump)
+                              (Console.WriteLine c))))
+                '("2"))
+  (check-equal? (run-tui '(let ([k 5])
+                            (Console.WriteLine (.Invoke (fn Func<int32> () (* k 2)))))
+                         '(let ([m 7])
+                            (Console.WriteLine (.Invoke (fn Func<int32> () (+ m 1))))))
+                '("10" "8")))
+
+(test-case "fn captures a variable that a macro introduces"
+  (check-equal?
+   (run-tui '(define-syntax-rule (counter-from start)
+               (let ([n start]) (fn Func<int32> () (set! n (+ n 1)) n)))
+            '(let ([next (counter-from 10)])
+               (Console.WriteLine (.Invoke next))
+               (Console.WriteLine (.Invoke next))))
+   '("11" "12")))
+
 (test-case "the REPL lifts lambdas defined in an interaction"
   (define mod (build-path examples "basics.rkt"))
   (dynamic-require mod #f)
@@ -197,5 +249,7 @@
                             (datum->syntax #f (cons '#%top-interaction form)))))))))
   (check-equal? (repl '(define (mk) : |Func<int32, int32>| (fn |Func<int32, int32>| (n) (+ n 1))))
                 '())
-  (check-equal? (repl '(Console.WriteLine (.Invoke (mk) 1))) '("2")))
+  (check-equal? (repl '(Console.WriteLine (.Invoke (mk) 1))) '("2"))
+  (check-equal? (repl '(let ([k 4]) (Console.WriteLine (.Invoke (fn Func<int32> () (* k k))))))
+                '("16")))
 
