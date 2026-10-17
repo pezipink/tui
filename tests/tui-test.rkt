@@ -58,7 +58,15 @@
    '("c")))
 
 (test-case "the list-of example runs"
-  (check-equal? (run-example "lists.rkt") '("3" "linus" "6")))
+  (check-equal? (run-example "lists.rkt") '("3" "linus" "6" "adagracelinus" "6")))
+
+(test-case "sum-of reads the element type from the closed List's metadata"
+  (check-regexp-match #rx"sum-of needs a list of int32 or string elements, got bool"
+                      (tui-error `(require (file ,(path->string (build-path examples "lists.rkt"))))
+                                 '(sum-of (list-of #t))))
+  (check-regexp-match #rx"sum-of needs a list .* got a non-list"
+                      (tui-error `(require (file ,(path->string (build-path examples "lists.rkt"))))
+                                 '(sum-of 1))))
 
 (test-case "list-of rejects elements and calls that do not match its type"
   (check-regexp-match #rx"expected int32, got string" (tui-error '(list-of 1 "a")))

@@ -38,7 +38,7 @@ Install Tui itself with `raco pkg install --link --name tui c:\repos\tui`.
 * Forms: `define`, `let`, `set!`, `begin`, `if`, `while`, `and`, `or`, `not`, `new`, `list-of`, the arithmetic operators `+ - * / %` (`+` also joins strings), the comparisons `< > <= >=`, and `=`.
 * `(list-of e ...)` builds a `System.Collections.Generic.List<T>`. T is the type of the first element and every other element must convert to it. `(list-of 1 "a")` is a type error. An empty list needs `(new System.Collections.Generic.List<T>)`.
 * Overloads are resolved at expansion time. The implicit conversions are widening (int32 to int64, integers to float64), boxing to `object`, and reference types to `object`.
-* Macros are ordinary hygienic `define-syntax-rule` macros.
+* Macros are hygienic. `define-syntax-rule` is the simple form. `define-syntax-parser` (from `syntax/parse/define`) can ask the type checker about an argument and read the CLR metadata behind it. `examples/lists.rkt` has `sum-of`, which reads the element type from the closed `List<T>`'s `get_Item` return type, and raises a syntax error for element types it does not support. The phase-1 helpers `tui-type-of` and `tui-member-return-type` are exported `for-syntax`.
 
 ## Running
 

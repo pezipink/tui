@@ -5,7 +5,9 @@
 ; internal definition contexts, so hygiene and define-syntax-rule macros work unchanged. Calls to
 ; .NET are resolved at expansion time by reading the referenced assemblies with Rangi's reader.
 ; The module's program is kept as ilasm datums, assembled with Rangi when it runs.
-(require (for-syntax racket/base racket/list racket/string syntax/parse "private/clr.rkt")
+(require (for-syntax racket/base racket/list racket/string syntax/parse syntax/parse/define
+                     "private/clr.rkt")
+         syntax/parse/define
          "private/runtime.rkt")
 
 (provide (rename-out [tui-module-begin #%module-begin]
@@ -17,7 +19,10 @@
                      [tui-+ +] [tui-- -] [tui-* *] [tui-/ /] [tui-% %]
                      [tui-< <] [tui-> >] [tui-<= <=] [tui->= >=] [tui-= =])
          ; syntax-rules compiles its patterns at phase 1, so the ellipsis is needed there too
-         using open define-syntax-rule ... _ (for-syntax ... _))
+         using open define-syntax-rule define-syntax define-syntax-parser require provide
+         for-syntax file
+         ... _ (for-syntax ... _)
+         (for-syntax tui-type-of tui-member-return-type tui-type->string))
 
 (module reader syntax/module-reader tui)
 
@@ -235,7 +240,10 @@
          [(free-identifier=? #'h #'tui-define) 'define]
          [(free-identifier=? #'h #'using) 'using]
          [(free-identifier=? #'h #'open) 'open]
-         [(free-identifier=? #'h #'define-syntax-rule) 'macro]
+         [(ormap (λ (k) (free-identifier=? #'h k))
+                 (list #'define-syntax-rule #'define-syntax #'define-syntax-parser
+                       #'require #'provide))
+          'passthrough]
          [else 'expr])]
       [_ 'expr]))
 
@@ -257,6 +265,20 @@
         (make-tui-fun '#,name (list #,@(for/list ([t ptypes]) #`(quote-syntax #,t)))
                       (quote-syntax #,ret)))))
 
+;; Phase 1 queries for user macros: the type checker, and the CLR metadata behind a type.
+(begin-for-syntax
+  ; The Tui type of a typed expression, from the type checker.
+  (define (tui-type-of stx)
+    (define-values (ty _code) (tc stx))
+    ty)
+
+  ; The return type of the first public instance method named name on the class type t, read from
+  ; the metadata of the closed type, or #f when there is no such method.
+  (define (tui-member-return-type t name)
+    (and (pair? t)
+         (let ([groups (find-instance-methods t name)])
+           (and (pair? groups) (clr-method-ret (car (car groups))))))))
+
 ;; ---------------------------------------------------------------------------------------------
 ;; Module and REPL
 
@@ -274,11 +296,11 @@
                    [(name ...) (for/list ([d defs])
                                  (let-values ([(n p t r b) (fun-header d)]) n))]
                    [(def ...) defs]
-                   [(macro ...) (of 'macro)]
+                   [(pass ...) (of 'passthrough)]
                    [(stmt ...) (of 'expr)])
        #`(#%module-begin
           (begin-for-syntax (tui-configure! '#,refs '#,opens))
-          macro ...
+          pass ...
           decl ...
           (define prog
             (make-tui-program (tui-reference-list)
@@ -318,7 +340,7 @@
         #`(begin (begin-for-syntax (tui-add-reference! #,p))
                  (tui-program-add-reference! #,prog #,p))]
        [(open) #`(begin-for-syntax (tui-add-open! #,(open-namespace #'form)))]
-       [(macro) #'form]
+       [(passthrough) #'form]
        [else #`(run-tui-main #,prog (tui-main/print form))])]))
 
 ;; ---------------------------------------------------------------------------------------------
