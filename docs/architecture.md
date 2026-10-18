@@ -86,7 +86,7 @@ expands an expression and returns its type. Two rules keep the types consistent:
 
 - Only types known at compile time are used. There is no unification and no inference from
   argument types beyond the rule in section 6.
-- A function's type comes from its declaration (`fun-header`, `fun-declaration`).
+- A function's type comes from its declaration (`fun-header`, `fun-declaration`), or from its body when the return type is omitted (section 6).
 
 A macro that builds `(tui-il ...)` by hand bypasses `il`, so it has no `'tui-type` property. In
 that case `tc` raises `internal: untyped fragment`. Build fragments with `il` or through ordinary
@@ -212,10 +212,29 @@ not guess.
 | Expected type | `'tui-expected` (`tc/expect`) | A `fn` with no delegate name (section 10), and a bare `null` (section 4) |
 | Declaration | annotations, `fun-header`, module `define` | Parameters, return types, module values |
 | CLR metadata | `clr-method` from `find-static-methods` and `find-instance-methods` | Overload candidates, parameter types, delegate `Invoke` arity |
+| Declaration | annotations, `fun-header`, module `define` | Parameters, return types, module values |
+| Body | the last expression of an unannotated function or module value, inferred on first use | Return types and module values with no annotation |
 | Bare fn placeholder | type `(lambda n)` and struct `deferred-fn` | A bare `fn` argument before its overload is chosen |
 | Bare null placeholder | type `'null-arg` (`null-placeholder`) and struct `deferred-fn` | A bare `null` argument before its overload is chosen |
 
-### CLR calls
+### Inferred return types and module values
+
+A `define` with no return type, and a module `define` with no annotation, takes its type from its
+expression. `make-tui-fun` and `make-tui-global` keep the definition in the binding (`def`), and the
+type is found when it is first needed (`tui-fun-result-type`, `global-result-type`, both through
+`infer-once!`). The type comes from `infer-function-type` or `infer-value-type`, which type the body
+or initializer in a discovery pass with no IL and no lambda lifting. The result is cached in the
+binding, and the code pass uses that same type, so callers and the callee agree. A function is typed
+with no value scope, because any function can be called from any module value's initializer.
+
+A cache entry is `'pending` while its body is typed. A reference to a definition that is still
+pending is a cycle, and it is an error (`cannot infer the return type of f, which depends on
+itself`). So a recursive function, direct or mutual, needs a return type annotation. A definition
+can refer to any function or module value in the module, because every binding is set before any
+body is typed. A tail `null` or bare `fn` has no expected type in an unannotated body, so write
+`(null-of T)` or annotate the return type.
+
+### Bare fn placeholder
 
 A call to a .NET method (`compile-static-call`, `compile-instance-call`, `tui-new`) runs in three steps.
 
@@ -378,9 +397,11 @@ A module value is a static field on the module class. Syntax:
 
 ```racket
 (define name : type expr)
+(define name expr)                ; type inferred from expr
 ```
 
-The type annotation is required. Each value gets:
+The type annotation is optional. Without one, the type is inferred from `expr` as for a function
+return type (section 6). A value that infers to `void` is an error. Each value gets:
 
 - a static field `name`, declared with `.field (public static)`;
 - a static method `__init_name` that computes `expr`.
@@ -394,7 +415,8 @@ Rules:
 - An initializer may read only the values defined before it. `value-scope` holds the names defined
   so far, and `check-global-scope` raises `module value used before it is defined` on a direct read
   of a later value. Reads through a function call are not checked, so `(define a : int (f))` where
-  `f` reads a later value is not caught.
+  `f` reads a later value is not caught. An inferred value's type is found in the same discovery
+  pass, with the same scope, so an inferred value cannot read a later value directly either.
 - A lambda that reads a module value needs no capture, because the value is a static field, and it
   sees the current value.
 - `set!` on a module value writes the field (`tui-set!` handles `tui-global`).
@@ -690,8 +712,10 @@ Common messages (the exact wording is in `main.rkt` and `private/clr.rkt`):
 - `module value used before it is defined`
 - `module values can only be defined in a module`
 - `module values are not first-class in Tui; use the name`
-- `expected (define name : type expr)`
-- `expected (define (name [param : type] ...) : type body ...+)`
+- `expected (define name [: type] expr)`
+- `expected (define (name [param : type] ...) [: type] body ...+)`
+- `cannot infer the return type of f, which depends on itself` (a recursive definition with no annotation)
+- `a module value cannot be void` (an unannotated module value whose expression is `void`)
 - `expected (fn [Delegate] (param ...) body ...+)`
 - `fn without a delegate type needs an expected delegate type or annotated parameters`
 - `fn has N parameters but X takes M`, `parameter n is T but D takes U`
@@ -781,6 +805,9 @@ and run `raco make main.rkt`.
 - The metadata helper keeps a snapshot for every file it has been sent and has no close request, so it holds on to closed files until it exits.
 - Inference is limited to exact `(mvar n)` parameters, base-type matches of generic instance
   parameters, and the bare `fn` body rule. There is no unification.
+- A return type or module value type is inferred from its body only when no annotation is given.
+  A recursive definition needs one. Inferring a body is a second typing pass, so compile time grows
+  with the number of unannotated definitions that call each other.
 - A parameter type inferred from a body call (Phase D) needs one overload with that name and arity.
   Overloaded methods such as `Console.WriteLine` need an annotation.
 - A bare `fn` cannot fix a type argument that appears only as a whole parameter `!!n`, and a

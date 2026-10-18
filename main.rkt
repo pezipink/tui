@@ -24,7 +24,7 @@
                      [tui-for-each for-each]
                      [tui-+ +] [tui-- -] [tui-* *] [tui-/ /] [tui-% %]
                      [tui-< <] [tui-> >] [tui-<= <=] [tui->= >=] [tui-= =]
-                     [tui-null null] [tui-null-of null-of] [tui-null? null?])
+                     [tui-null null]                      [tui-null-of null-of] [tui-null? null?] [tui-typeof typeof])
          ; syntax-rules compiles its patterns at phase 1, so the ellipsis is needed there too
          using open define-syntax-rule define-syntax define-syntax-parser require provide
          define-simple-macro define-syntax-class define-splicing-syntax-class pattern
@@ -445,16 +445,44 @@
                                     stx))
               (append (cadr cl) (cdr c))]))))]))
 
-  ;; Tui functions: (define (f [x : T] ...) : R body ...+). The binding of f holds its declared
+  ;; Tui functions: (define (f [x : T] ...) [: R] body ...+). The binding of f holds its declared
   ;; signature as syntax; types are resolved when used, after the module's references are set.
-  (struct tui-fun (name params ret)
+  ; ret is #f when the return type is omitted. Then it is the type of the body, inferred from def
+  ; when first needed and kept in inferred.
+  (struct tui-fun (name params ret def [inferred #:mutable])
     #:property prop:procedure
     (λ (self stx)
       (syntax-parse stx
         [(f:id arg ...) (compile-tui-call self stx (syntax->list #'(arg ...)))]
         [_ (raise-syntax-error 'tui "functions are not first-class in Tui; call it instead" stx)])))
 
-  (define (make-tui-fun name params ret) (tui-fun name params ret))
+  (define (make-tui-fun name params ret def) (tui-fun name params ret def #f))
+
+  ; The type of a definition whose type is omitted, inferred from its body the first time it is
+  ; needed. get and put! read and write the cached type, and infer computes it. While it is being
+  ; inferred the cache holds 'pending, so a definition that needs its own type is recursive.
+  (define (infer-once! get put! name stx what infer)
+    (define known (get))
+    (cond
+      [(eq? known 'pending)
+       (raise-syntax-error 'tui (format "cannot infer the ~a of ~a, which depends on itself; add a ~a annotation"
+                                        what name what)
+                           stx)]
+      [known known]
+      [else
+       (put! 'pending)
+       (define t (with-handlers ([exn:fail? (λ (e) (put! #f) (raise e))]) (infer)))
+       (put! t)
+       t]))
+
+  ; The return type of f, called from stx.
+  (define (tui-fun-result-type f stx)
+    (cond
+      [(tui-fun-ret f) => ann->type]
+      [else
+       (infer-once! (λ () (tui-fun-inferred f)) (λ (t) (set-tui-fun-inferred! f t))
+                    (tui-fun-name f) stx "return type"
+                    (λ () (infer-function-type (tui-fun-def f))))]))
 
   ; Module values: (define name : T expr). The binding of name holds its declared type as syntax.
   ; A reference loads the static field of <Module>, which is set when the program starts. While a
@@ -462,19 +490,39 @@
   ; reference to any other module value is an error.
   (define value-scope (make-parameter #f))
 
-  (struct tui-global (name type)
+  ; A module value (define name [: T] expr). type is the annotation as syntax, or #f when it is
+  ; omitted, and then the type is inferred from def the first time it is needed. earlier lists the
+  ; values set before this one, as symbols.
+  (struct tui-global (name type def earlier [inferred #:mutable])
     #:property prop:procedure
     (λ (self stx)
       (cond
         [(identifier? stx)
          (check-global-scope self stx)
-         (il (global-type self) (list `(ldsfld Program ,(tui-global-name self)
-                                               ,(tui-type->il (global-type self)))))]
-        [else (delegate-call stx (global-type self))])))
+         (let ([t (global-result-type self stx)])
+           (il t (list `(ldsfld Program ,(tui-global-name self) ,(tui-type->il t)))))]
+        [else (delegate-call stx (global-result-type self stx))])))
 
-  (define (make-tui-global name type) (tui-global name type))
+  (define (make-tui-global name type def earlier) (tui-global name type def earlier #f))
 
-  (define (global-type g) (ann->type (tui-global-type g)))
+  (define (global-result-type g stx)
+    (cond
+      [(tui-global-type g) => ann->type]
+      [else
+       (infer-once! (λ () (tui-global-inferred g)) (λ (t) (set-tui-global-inferred! g t))
+                    (tui-global-name g) stx "type"
+                    (λ () (infer-value-type (tui-global-def g) (tui-global-earlier g))))]))
+
+  ; The type of the expression of a module value def, found by a discovery pass in the scope of
+  ; the values set before it.
+  (define (infer-value-type def earlier)
+    (define-values (_code _m bty)
+      (parameterize ([current-pass (pass #t (make-hasheqv) (make-hasheqv) 0 0)]
+                     [value-scope earlier])
+        (compile-body def '() (list (last (syntax->list def))) #f #f #f)))
+    (when (eq? bty 'void)
+      (raise-syntax-error 'tui "a module value cannot be void" def))
+    bty)
 
   (define (check-global-scope g stx)
     (define scope (value-scope))
@@ -483,11 +531,11 @@
 
   (define (compile-tui-call f stx args)
     (define ptys (map ann->type (tui-fun-params f)))
-    (define rty (ann->type (tui-fun-ret f)))
     (unless (= (length args) (length ptys))
       (raise-syntax-error 'tui (format "~a expects ~a arguments, got ~a"
                                        (tui-fun-name f) (length ptys) (length args))
                           stx))
+    (define rty (tui-fun-result-type f stx))
     (il rty (append (append* (map tc/expect args ptys))
                     `((call ,(tui-type->il rty) (Program) ,(tui-fun-name f)
                             ,(map tui-type->il ptys))))))
@@ -495,16 +543,28 @@
   (define-syntax-class param
     (pattern [name:id (~datum :) type:id]))
 
+  ; The return type is #f when it is omitted, and then it is inferred from the body.
   (define (fun-header def)
     (syntax-parse def
       [(_ (name:id p:param ...) (~datum :) ret:id body ...+)
        (values #'name (syntax->list #'(p.name ...)) (syntax->list #'(p.type ...)) #'ret
                (syntax->list #'(body ...)))]
       [(_ (name:id p:param ...) body ...+)
-       (values #'name (syntax->list #'(p.name ...)) (syntax->list #'(p.type ...))
-               (datum->syntax #'name 'void) (syntax->list #'(body ...)))]
-      [_ (raise-syntax-error 'tui "expected (define (name [param : type] ...) : type body ...+)"
+       (values #'name (syntax->list #'(p.name ...)) (syntax->list #'(p.type ...)) #f
+               (syntax->list #'(body ...)))]
+      [_ (raise-syntax-error 'tui "expected (define (name [param : type] ...) [: type] body ...+)"
                              def)]))
+
+  ; The type of the body of function def, found by a discovery pass that emits no code.
+  (define (infer-function-type def)
+    (define-values (name pnames ptypes ret body) (fun-header def))
+    (define ptys (map ann->type ptypes))
+    (define-values (_code _m bty)
+      (parameterize ([current-pass (pass #t (make-hasheqv) (make-hasheqv) 0 0)]
+                     [value-scope #f])
+        (compile-body def (for/list ([p pnames] [t ptys] [i (in-naturals)]) (list p 'arg i t))
+                      body #f #f #f)))
+    bty)
 
   ; Compiles one method body. binds are (id kind index type), parent is the enclosing method of
   ; a lambda (#f for a method), and owner is the lambda's class (#f for a method). rty is the
@@ -567,7 +627,7 @@
   (define (compile-function def)
     (define-values (name pnames ptypes ret body) (fun-header def))
     (define ptys (map ann->type ptypes))
-    (define rty (ann->type ret))
+    (define rty (tui-fun-result-type (syntax-local-value name) def))
     (record-scope! name
                    (format "(~a) -> ~a" (string-join (map tui-type->string ptys) ", ")
                            (tui-type->string rty))
@@ -587,8 +647,8 @@
 
   (define (value-parts def earlier)
     (syntax-parse def
-      [(_ name:id (~datum :) t:id e)
-       (define rty (ann->type #'t))
+      [(_ name:id (~optional (~seq (~datum :) t:id)) e)
+       (define rty (global-result-type (syntax-local-value #'name) def))
        (record-scope! #'name (tui-type->string rty) 0 +inf.0)
        (define-values (code m _rty)
          (run-passes
@@ -599,7 +659,7 @@
                          () (cil managed)
                          (,@(locals-decl (mctx-locals m)) ,@code))
                `(.field (public static) ,(tui-type->il rty) ,(syntax-e #'name)))]
-      [_ (raise-syntax-error 'tui "expected (define name : type expr)" def)]))
+      [_ (raise-syntax-error 'tui "expected (define name [: type] expr)" def)]))
 
   ; The static initializers, run in order at the start of the entry point. inits is a list of
   ; (name type) in source order.
@@ -834,12 +894,14 @@
       [(_ ns:id) (symbol->string (syntax-e #'ns))]
       [_ (raise-syntax-error 'tui "expected (open Namespace)" f)]))
 
-  ; (define-syntax f (make-tui-fun ...)) for a Tui function definition.
+  ; (define-syntax f (make-tui-fun ...)) for a Tui function definition. The return type is quoted
+  ; only when it is written.
   (define (fun-declaration def)
     (define-values (name pnames ptypes ret body) (fun-header def))
     #`(define-syntax #,name
         (make-tui-fun '#,name (list #,@(for/list ([t ptypes]) #`(quote-syntax #,t)))
-                      (quote-syntax #,ret))))
+                      #,(and ret #`(quote-syntax #,ret))
+                      (quote-syntax #,def))))
 
   ; (record Name [field : type] ...): declares the type in the local assembly, so later code in the
   ; module is checked against it, and returns the ilasm datum of its class.
@@ -967,16 +1029,19 @@
      (define vals (of 'value))
      (define val-names (for/list ([v vals]) (list-ref (syntax->list v) 1)))
      (define val-decls
-       (for/list ([v vals])
-         (let ([l (syntax->list v)])
-           #`(define-syntax #,(list-ref l 1)
-               (make-tui-global '#,(syntax-e (list-ref l 1)) (quote-syntax #,(list-ref l 3)))))))
+       (for/list ([v vals] [i (in-naturals)])
+         (let* ([l (syntax->list v)]
+                [name (list-ref l 1)]
+                [ann (and (= (length l) 5) (list-ref l 3))])
+           #`(define-syntax #,name
+               (make-tui-global '#,(syntax-e name) #,(and ann #`(quote-syntax #,ann))
+                                (quote-syntax #,v) '#,(map syntax-e (take val-names i)))))))
      (define val-methods
        (for/list ([v vals] [i (in-naturals)])
          #`(tui-value-decls #,v #,@(take val-names i))))
      (define val-inits
        (for/list ([v vals])
-         (let ([l (syntax->list v)]) #`(#,(list-ref l 1) #,(list-ref l 3)))))
+         #`(#,(list-ref (syntax->list v) 1))))
      (with-syntax ([prog (datum->syntax stx '%tui-program)]
                    ; records are declared before any function or value is checked
                    [(rec ...) (for/list ([r (of 'record)])
@@ -1070,7 +1135,8 @@
   (syntax-case stx ()
     [(_ (init ...) form ...)
      (let ([inits (for/list ([i (in-list (syntax->list #'(init ...)))])
-                    (syntax-case i () [(n t) (list (syntax-e #'n) (ann->type #'t))]))])
+                    (syntax-case i ()
+                      [(n) (list (syntax-e #'n) (global-result-type (syntax-local-value #'n) #'n))]))])
        #`(quote #,(datum->syntax #f (compile-main stx (syntax->list #'(form ...)) #f inits))))]))
 
 (define-syntax (tui-main/print stx)
@@ -1150,6 +1216,25 @@
                            #'t))
      (il (attribute t.Type) '((ldnull)))]))
 
+; (typeof T) is the System.Type of the type name T: a ldtoken of T, passed to Type.GetTypeFromHandle.
+; The token operand is a primitive, or the name of a class with no type arguments.
+(define-tui-form (tui-typeof stx)
+  (syntax-parse stx
+    [(_ t:typeName)
+     (define ty (attribute t.Type))
+     (when (eq? ty 'void) (raise-syntax-error 'tui "typeof needs a type, got void" #'t))
+     (unless (or (symbol? ty) (and (pair? ty) (eq? (car ty) 'class) (null? (class-args ty))))
+       (raise-syntax-error 'tui (format "typeof supports primitives and classes without type arguments, got ~a"
+                                        (tui-type->string ty))
+                           #'t))
+     (define operand (if (symbol? ty) (tui-type->il ty) (cadr (tui-type->il ty))))
+     (define sys-type (with-clr stx (λ () (string->tui-type "System.Type"))))
+     (define handle-type (with-clr stx (λ () (string->tui-type "System.RuntimeTypeHandle"))))
+     (il sys-type
+         `((ldtoken ,operand)
+           (call ,(tui-type->il sys-type) ,(owner->il sys-type) GetTypeFromHandle
+                 (,(tui-type->il handle-type)))))]))
+
 ; (null? e) is true when the reference e is null.
 (define-tui-form (tui-null? stx)
   (syntax-parse stx
@@ -1219,7 +1304,7 @@
   (define (delegate-value-type head)
     (define v (and (identifier? head) (syntax-local-value head (λ () #f))))
     (define t (cond [(tui-var? v) (tui-var-type v)]
-                    [(tui-global? v) (global-type v)]
+                    [(tui-global? v) (global-result-type v head)]
                     [else #f]))
     (and t (delegate-type? t) t))
 
@@ -1550,7 +1635,7 @@
         (il ty code)]
        [(tui-global? v)
         (check-global-scope v #'x)
-        (define ty (global-type v))
+        (define ty (global-result-type v #'x))
         (record-tooltip! #'x ty)
         (il 'void (append (tc/expect #'e ty)
                           `((stsfld Program ,(tui-global-name v) ,(tui-type->il ty)))))]

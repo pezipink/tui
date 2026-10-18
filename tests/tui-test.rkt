@@ -304,6 +304,8 @@
   (check-equal? (repl '(Console.WriteLine "side effect")) '("side effect"))
   (check-equal? (repl '(define (sq [x : int]) : int (* x x))) '())
   (check-equal? (repl '(sq (fact 4))) '("576"))
+  (check-equal? (repl '(define (cube [x : int]) (* x (* x x)))) '())
+  (check-equal? (repl '(Console.WriteLine (cube 3))) '("27"))
   (check-exn #rx"expected int32, got string"
              (λ () (repl '(sq "four")))))
 
@@ -789,6 +791,44 @@
                          '(Console.WriteLine (get)))
                 '("7")))
 
+(test-case "return types and module values are inferred from the last expression"
+  (check-equal? (run-example "inference.rkt") '("25" "50" "42"))
+  (check-equal? (run-tui '(define-syntax-rule (twice e) (* 2 e))
+                         '(define (f [x : int]) (twice x))
+                         '(Console.WriteLine (f 21)))
+                '("42"))
+  (check-equal? (run-tui '(define (f [x : int]) (* x 2))
+                         '(Console.WriteLine (f 21)))
+                '("42"))
+  (check-equal? (run-tui '(define (a [x : int]) (b x))
+                         '(define (b [x : int]) (+ x 1))
+                         '(Console.WriteLine (a 1)))
+                '("2"))
+  (check-equal? (run-tui '(define (show [x : int]) (Console.WriteLine x))
+                         '(show 3))
+                '("3"))
+  (check-equal? (run-tui '(define a (+ 1 2))
+                         '(define b (* a 2))
+                         '(define (g [x : int]) (+ x b))
+                         '(Console.WriteLine (g 1)))
+                '("7")))
+
+(test-case "an inferred return type that depends on itself is an error"
+  (check-regexp-match #rx"cannot infer the return type of f, which depends on itself"
+                      (tui-error '(define (f [n : int]) (if (< n 1) 1 (f (- n 1))))))
+  (check-regexp-match #rx"cannot infer the return type of a, which depends on itself"
+                      (tui-error '(define (a [x : int]) (b x))
+                                 '(define (b [x : int]) (a x))))
+  (check-equal? (run-tui '(define (f [n : int]) : int (if (< n 1) 1 (f (- n 1))))
+                         '(Console.WriteLine (f 4)))
+                '("1")))
+
+(test-case "an inferred module value cannot use a later value or be void"
+  (check-regexp-match #rx"module value used before it is defined"
+                      (tui-error '(define a (+ b 1)) '(define b : int 1)))
+  (check-regexp-match #rx"a module value cannot be void"
+                      (tui-error '(define a (Console.WriteLine 1)))))
+
 (test-case "a module value cannot be read before its definition"
   (check-regexp-match #rx"module value used before it is defined"
                       (tui-error '(define a : int (+ b 1)) '(define b : int 1)))
@@ -803,7 +843,7 @@
              (λ () (parameterize ([current-namespace ns])
                      (eval (namespace-syntax-introduce
                             (datum->syntax #f '(#%top-interaction define x : int 1)))))))
-  (check-regexp-match #rx"expected \\(define name : type expr\\)"
+  (check-regexp-match #rx"expected \\(define name \\[: type\\] expr\\)"
                       (tui-error '(define x : int)))
   (check-exn #rx"record is only allowed at module level"
              (λ () (parameterize ([current-namespace ns])
