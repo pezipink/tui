@@ -115,14 +115,29 @@ Inference is intentionally basic. Nothing is unified across expressions.
 
 - **Expression types** come from the expansion of each subform (section 4). Each compound form is
   built from its children's types, so types flow upward.
-- **Generic method type arguments** (`infer-targs`) are inferred only when a parameter is exactly
-  `(mvar n)`. The argument's type then fixes `!!n`, and every `!!n` must be fixed by one type.
-  Any other generic parameter, such as `IEnumerable<!!0>`, is not matched. For those, write the type
-  arguments explicitly: `Enumerable.Where<int32>`.
+- **Generic method type arguments** (`infer-targs`) are inferred from the arguments in three ways:
+  - A parameter that is exactly `(mvar n)` fixes `!!n` to the argument's type. Every `!!n` must be
+    fixed by one type.
+  - A generic instance parameter, such as `IEnumerable<!!0>`, is matched against the argument's
+    base types (`matching-supertype`). A `List<int32>` argument fixes `!!0` to `int32`.
+  - A type argument that only bare `fn` parameters mention is left open. The `fn` body then fixes it
+    (section 10, Phase E).
+- **Overloads with generic and non-generic candidates** (`resolve-overload`): when costs tie, the
+  non-generic method wins, as in C#. `String.Concat` and `Enumerable.Max` resolve this way.
 - **Explicit type arguments** (`Name<A>` in the call) are used as given and must match the arity.
+- **Parameter types of an unannotated `fn`** (`body-param-types`, Phase D): a parameter that is a
+  direct argument of a call in the body takes the parameter type of that call's overload, if the
+  name and arity have exactly one overload, it is not generic, and the type is closed. The calls
+  are `Type.Method` (static) and `.Method recv` (instance, where `recv` is a variable with a known
+  type). Nested `fn`, `let`, `let*`, `letrec` and `define` are not scanned.
 
-Example: `(Enumerable.Where<int32> xs (fn (x) (> x 2)))` is accepted. `(Enumerable.Where xs ...)`
-fails, because the `IEnumerable<T>` parameter does not match `(mvar 0)` exactly.
+Examples:
+- `(Enumerable.Where<int32> xs (fn (x) (> x 2)))` is accepted.
+- `(Enumerable.Where xs (fn (x) (> x 2)))` is also accepted when `xs` is a `List<int32>`. The list's
+  `IEnumerable<int32>` base type fixes `!!0`, and the `fn` takes `Func<int32, bool>`.
+- `(Enumerable.Sum (Enumerable.Select xs (fn (x) (* x 2))))` infers `Select`'s `TResult` from the
+  body (Phase E).
+- `(let ([f (fn (s) (String.IsNullOrEmpty s))]) ...)` infers `s : string` (Phase D).
 
 ## 7. Overloads and conversions
 
@@ -206,6 +221,36 @@ an argument of a method that takes one. `compile-lambda` produces:
 - a generated class with one field per captured cell and an `Invoke` method;
 - a delegate over `Invoke` on an instance of that class.
 
+Without a delegate name, `fn` takes its type in one of three ways:
+
+- **From the expected type** (`tc/expect` sets `'tui-expected`): a `define` return type or a
+  parameter of a Tui function.
+- **From the chosen overload** (Phase B): a bare `fn` argument of a CLR call, constructor, or
+  instance call. `tc-args` detects it with `local-expand` (stop ids `tui-il` and `tui-fn`) and
+  types it as a `lambda-placeholder` of its arity. `resolve-overload` matches a placeholder against
+  any delegate parameter whose `Invoke` has that arity (`arg-coercion`). After the overload is
+  chosen, `finish-args` compiles the `fn` against that parameter type with `tc/expect`. If two
+  overloads match, the call is ambiguous and is rejected.
+- **From the body** (Phase A): every parameter is annotated (`(fn ([x : int]) body)`). The body's
+  type picks `Action<...>` when it is `void`, otherwise `Func<..., R>`. The delegate is built with
+  the `Func` or `Action` of those types from `compile-lambda`, so no `|Func<...>|` name is needed.
+- **Parameters from a call in the body** (Phase D, `body-param-types`): an unannotated parameter
+  that is a direct argument of a call in the body takes that call's parameter type, when the name
+  and arity have exactly one closed, non-generic overload. Calls are `Type.Method` and
+  `.Method recv` with a variable receiver. The scan skips nested binders, so it does not look
+  inside `fn`, `let`, `let*`, `letrec` or `define`. Example: `(fn (s) (String.IsNullOrEmpty s))`.
+  Overloaded methods such as `Console.WriteLine` give no inference, so the parameter must be
+  annotated.
+
+Phase E fixes a generic CLR method's type arguments from a bare `fn` argument. In
+`Enumerable.Select xs (fn (x) (* x 2))`, `xs` fixes `TSource`, and the `fn`'s body type fixes
+`TResult`. `compile-partial-fn` gives the `fn`'s parameters the types the delegate already fixes,
+leaves the open ones out, compiles the `fn`, and then binds its type with `bind-type`.
+`finish-call` checks that no type argument is still open, and then converts each argument to the
+closed parameter type. A bare `fn` cannot supply a parameter type that is only `!!n`, and a delegate
+class argument that is an unbound `!!n` cannot be inferred. Both give
+`cannot infer the type of a parameter of this fn` or `cannot infer the type arguments of ...`.
+
 A lambda is a value. It can be stored with `let`, passed as an argument, returned, and invoked with
 `.Invoke`. A delegate is called with `.Invoke`, as in `(.Invoke f x)`. Writing `(f x)` for a delegate `f` is an
 error. Functions are called directly, which emits `call` on `Program`. A module value applied as
@@ -285,7 +330,15 @@ Common messages (the exact wording is in `main.rkt` and `private/clr.rkt`):
 - `expected (define name : type expr)`
 - `expected (define (name [param : type] ...) : type body ...+)`
 - `expected (fn [Delegate] (param ...) body ...+)`
-- `fn without a delegate type needs an expected delegate type`
+- `fn without a delegate type needs an expected delegate type or annotated parameters`
+- `fn has N parameters but X takes M`, `parameter n is T but D takes U`
+- `parameter x is T but the delegate passes U` (a bare `fn` whose parameter annotation disagrees)
+- `cannot infer the type of a parameter of this fn` (a bare `fn` whose delegate parameter is still open)
+- `cannot infer the type arguments of M` (a generic CLR method whose type argument no argument fixes)
+- `fn has type X, which does not fit Y` (a bare `fn` whose body type does not match the open parameter)
+- `argument has type X, expected Y` (a bare `fn` argument that does not match the closed parameter)
+- `function returns X but its body has type Y`
+- `no overload of X accepts (fn/n, ...)` (a bare `fn/n` is a lambda of arity n)
 - `not a variable`
 - `unknown type`
 - `internal: untyped fragment` (a hand-built `tui-il` form, section 4)
@@ -313,6 +366,11 @@ and run `raco make main.rkt`.
 | `basics.rkt` | recursion, loops, locals, calls into mscorlib | `examples run` |
 | `captures.rkt` | shared captures, nesting, per-iteration `let` | `fn captures locals and arguments by reference`, `lambdas nest and share mutable captures ...` |
 | `delegates.rkt` | `fn` for `Action`, `Func`, `Predicate` | `fn builds delegates for Action, Func and Predicate` |
+| (inline tests) | annotated `fn` params take `Func` or `Action` from the body | `annotated fn parameters take Func or Action from the body type` |
+| (inline tests) | bare `fn` argument takes its delegate type from the overload | `a bare fn argument takes its delegate type from the chosen overload` |
+| (inline tests) | generic CLR method type arguments through base types | `generic methods bind type arguments through base types` |
+| (inline tests) | bare `fn` argument fixes a method type parameter that only it mentions | `a bare fn argument fixes a method type parameter that only it mentions` |
+| (inline tests) | unannotated `fn` parameter takes the type of the one overload its body fixes | `an unannotated fn parameter takes the type of the one overload a call in its body fixes` |
 | `macros.rkt` | hygienic macros | `Tui macros are hygienic` |
 | `types.rkt` | `default-of`, `type-name-of` | `default-of takes a type name ...`, `type-name-of expands ...` |
 | `lists.rkt` | `list-of`, `sum-of` | `the list-of example runs`, `sum-of reads the element type ...` |
@@ -323,7 +381,12 @@ and run `raco make main.rkt`.
 
 ## 17. Known limits
 
-- Inference covers only exact `(mvar n)` parameters. There is no unification.
+- Inference is limited to exact `(mvar n)` parameters, base-type matches of generic instance
+  parameters, and the bare `fn` body rule. There is no unification.
+- A parameter type inferred from a body call (Phase D) needs one overload with that name and arity.
+  Overloaded methods such as `Console.WriteLine` need an annotation.
+- A bare `fn` cannot fix a type argument that appears only as a whole parameter `!!n`, and a
+  delegate class argument that is an unbound `!!n` cannot be inferred.
 - A read of a later module value through a function call from an initializer is not caught.
 - A delegate cannot be called as `(f x)`. Use `.Invoke`.
 - `.Count` is rejected; write `get_Count` or use the property getter form.

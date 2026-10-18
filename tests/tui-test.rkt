@@ -210,6 +210,100 @@
   (check-regexp-match #rx"needs an expected delegate type"
                       (tui-error '(let ([f (fn (n) n)]) f))))
 
+(test-case "annotated fn parameters take Func or Action from the body type"
+  (check-equal? (run-tui '(let ([even (fn ([x : int]) (= (% x 2) 0))])
+                            (Console.WriteLine (.Invoke even 4))
+                            (Console.WriteLine (.Invoke even 3))))
+                '("True" "False"))
+  (check-equal? (run-tui '(let ([k 3])
+                            (let ([add (fn ([a : int] [b : int]) (+ (+ a b) k))])
+                              (Console.WriteLine (.Invoke add 1 2)))))
+                '("6"))
+  (check-equal? (run-tui '(let ([say (fn ([s : string]) (Console.WriteLine s))])
+                            (.Invoke say "hi")))
+                '("hi"))
+  (check-equal? (run-tui '(let ([hello (fn () (Console.WriteLine "hello"))])
+                            (.Invoke hello)))
+                '("hello"))
+  (check-equal? (run-tui '(let ([five (fn () 5)])
+                            (Console.WriteLine (.Invoke five))))
+                '("5"))
+  (check-regexp-match #rx"parameter n is string but .*Func<int32, int32> takes int32"
+                      (tui-error '(let ([g (fn |Func<int32, int32>| ([n : string]) 1)]) g)))
+  (check-regexp-match #rx"fn without a delegate type needs an expected delegate type or annotated"
+                      (tui-error '(let ([f (fn ([x : int] y) x)]) f)))
+  (check-regexp-match #rx"expected a parameter name"
+                      (tui-error '(let ([f (fn (1) 1)]) f))))
+
+(test-case "a bare fn argument takes its delegate type from the chosen overload"
+  (define (int-list . vals)
+   `(let ([xs (new |System.Collections.Generic.List<int32>|)])
+      ,@(for/list ([v vals]) `(.Add xs ,v))
+      xs))
+  (check-equal? (run-tui `(let ([xs ,(int-list 1 2)])
+                           (.ForEach xs (fn (x) (Console.WriteLine x)))))
+               '("1" "2"))
+  (check-equal? (run-tui `(let ([xs ,(int-list 1 2 3)])
+                           (Console.WriteLine (.Find xs (fn (x) (= (% x 2) 0))))))
+               '("2"))
+  (check-equal? (run-tui `(let ([xs ,(int-list 1 2)] [k 10])
+                           (.ForEach xs (fn (x) (Console.WriteLine (+ x k))))))
+               '("11" "12"))
+  (check-equal? (run-tui `(let ([xs ,(int-list 5)])
+                           (.ForEach xs (fn Action<int32> (x) (Console.WriteLine x)))))
+               '("5"))
+  (check-regexp-match #rx"no overload of .*ForEach accepts \\(fn/2\\)"
+                     (tui-error `(let ([xs ,(int-list 1)]) (.ForEach xs (fn (x y) x)))))
+  (check-regexp-match #rx"no overload of Console.WriteLine accepts \\(fn/1\\)"
+                     (tui-error '(Console.WriteLine (fn (x) x))))
+  (check-regexp-match #rx"parameter x is string but System.Action<int32> takes int32"
+                     (tui-error `(let ([xs ,(int-list 1)])
+                                   (.ForEach xs (fn ([x : string]) (Console.WriteLine x)))))))
+
+(test-case "generic methods bind type arguments through base types"
+  (define (int-list . vals)
+   `(let ([xs (new |System.Collections.Generic.List<int32>|)])
+      ,@(for/list ([v vals]) `(.Add xs ,v))
+      xs))
+  (check-equal? (run-tui '(using "System.Core") '(open System.Linq)
+                         `(Console.WriteLine (Enumerable.Count ,(int-list 1 2 3))))
+               '("3"))
+  (check-equal? (run-tui '(using "System.Core") '(open System.Linq)
+                         `(Console.WriteLine (Enumerable.Count<int32> ,(int-list 1 2))))
+               '("2")))
+
+(test-case "a bare fn argument fixes a method type parameter that only it mentions"
+  (define (int-list . vals)
+   `(let ([xs (new |System.Collections.Generic.List<int32>|)])
+      ,@(for/list ([v vals]) `(.Add xs ,v))
+      xs))
+  (check-equal? (run-tui '(using "System.Core") '(open System.Linq)
+                         `(Console.WriteLine
+                           (Enumerable.Sum (Enumerable.Select ,(int-list 1 2 3) (fn (x) (* x 2))))))
+               '("12"))
+  (check-equal? (run-tui '(using "System.Core") '(open System.Linq)
+                         `(Console.WriteLine
+                           (Enumerable.Count (Enumerable.Where ,(int-list 1 2 3) (fn (x) (> x 2))))))
+               '("1"))
+  (check-equal? (run-tui '(using "System.Core") '(open System.Linq)
+                         `(let ([k 10])
+                            (Console.WriteLine
+                             (Enumerable.Count (Enumerable.Select ,(int-list 1 2) (fn (x) (+ x k)))))))
+               '("2")))
+
+(test-case "an unannotated fn parameter takes the type of the one overload a call in its body fixes"
+  (check-equal? (run-tui '(let ([f (fn (s) (String.IsNullOrEmpty s))])
+                            (Console.WriteLine (.Invoke f ""))))
+               '("True"))
+  (check-equal? (run-tui '(let ([xs (new |System.Collections.Generic.List<int32>|)])
+                            (let ([add (fn (x) (.Add xs x))])
+                              (.Invoke add 4)
+                              (.Invoke add 6)
+                              (Console.WriteLine (.Contains xs 6)))))
+               '("True"))
+  (check-regexp-match #rx"fn without a delegate type needs"
+                     (tui-error '(let ([f (fn (x) (Console.WriteLine x))]) f))))
+
 (test-case "lambdas nest and share mutable captures through their generated classes"
   (check-equal? (run-tui '(define (outer [a : int]) : |Func<int32, int32>|
                             (let ([b 10])

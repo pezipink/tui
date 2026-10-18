@@ -83,16 +83,18 @@
 
   (define (cell-ordinal? ord) (hash-ref (pass-cells (current-pass)) ord #f))
 
-  ; Calls thunk, which compiles one method body and returns (values code locals-or-mctx). Returns
-  ; the result of the second pass if the body has lambdas, otherwise the result of the first.
+  ; Calls thunk, which compiles one method body and returns its results (for example the code and
+  ; the mctx). Returns the results of the second pass if the body has lambdas, otherwise those of the first.
   (define (run-passes thunk)
     (define d (pass #t (make-hasheqv) (make-hasheqv) 0 0))
-    (define-values (code0 r0) (parameterize ([current-pass d]) (thunk)))
+    (define results (call-with-values (λ () (parameterize ([current-pass d]) (thunk))) list))
     (cond
-      [(zero? (pass-lambdas d)) (values code0 r0)]
+      [(zero? (pass-lambdas d)) (apply values results)]
       [else
-       (parameterize ([current-pass (pass #f (pass-used d) (make-hasheqv) 0 0)])
-         (thunk))]))
+       (call-with-values
+        (λ () (parameterize ([current-pass (pass #f (pass-used d) (make-hasheqv) 0 0)])
+                (thunk)))
+        values)]))
 
   ; Each lambda becomes a generated class. Its datum is lifted with syntax-local-lift-expression,
   ; and the lifted identifiers wait here until tui-lifts-into adds them to the program.
@@ -241,6 +243,103 @@
   (define (args-code codes convs)
     (append* (map append codes convs)))
 
+  ; The arguments of a CLR call are typed before the overload is chosen, except bare fns. A bare
+  ; fn (one without a delegate name) is typed as a placeholder of its arity and compiled against
+  ; the chosen overload's parameter type by finish-call. Each argument gives its type and its code,
+  ; or a deferred-fn.
+  (struct deferred-fn (stx))
+
+  ; The arity of a bare fn form (fn (p ...) body ...+) as expanded, or #f for any other form.
+  (define (bare-fn-arity e)
+    (define xs (syntax->list e))
+    (and xs
+         (>= (length xs) 3)
+         (identifier? (car xs))
+         (free-identifier=? (car xs) #'tui-fn 0 0)
+         (let ([ps (syntax->list (cadr xs))])
+           (and ps (length ps)))))
+
+  (define (tc-args stxs)
+    (for/lists (tys codes) ([s (in-list stxs)])
+      (define e (local-expand s 'expression (list #'tui-il #'tui-fn) #f))
+      (define n (bare-fn-arity e))
+      (if n
+          (values (lambda-placeholder n) (deferred-fn e))
+          (tc e))))
+
+  ; The code of each argument for the closed method's parameter types params, with the conversions
+  ; from resolve-overload. A deferred fn is compiled against its parameter type, and needs no
+  ; conversion.
+  (define (finish-args codes convs params)
+    (append*
+     (for/list ([c (in-list codes)] [conv (in-list convs)] [p (in-list params)])
+       (if (deferred-fn? c)
+           (tc/expect (deferred-fn-stx c) p)
+           (append c conv)))))
+
+  ; Compiles a bare fn whose parameter type p may still have open type arguments, held in the
+  ; vector slots (filled in here). The fn's parameters take the types that p already fixes, and the
+  ; body's Func or Action type then fixes the rest through bind-type. Returns the fn's type and code.
+  (define (compile-partial-fn e p slots)
+    (define known (subst-mvars p (vector->list slots)))
+    (define xs (syntax->list e))
+    (define ptys
+      (for/list ([i (in-list (delegate-param-args known))])
+        (define t (and i (list-ref (class-args known) i)))
+        (unless (and t (not (has-mvar? t)))
+          (raise-syntax-error 'tui "cannot infer the type of a parameter of this fn" e))
+        t))
+    (define typed
+      (for/list ([a (in-list (lambda-params (syntax->list (cadr xs))))] [t (in-list ptys)])
+        (when (and (cdr a) (not (equal? (cdr a) t)))
+          (raise-syntax-error 'tui (format "parameter ~a is ~a but the delegate passes ~a"
+                                           (syntax-e (car a)) (tui-type->string (cdr a))
+                                           (tui-type->string t))
+                              e (car a)))
+        (cons (car a) t)))
+    (define-values (fty fcode) (tc (compile-lambda e #f typed (cddr xs))))
+    (unless (bind-type p fty slots)
+      (raise-syntax-error 'tui (format "fn has type ~a, which does not fit ~a"
+                                       (tui-type->string fty) (tui-type->string p))
+                          e))
+    (values fty fcode))
+
+  ; The closed method and the argument code for a call to m, which resolve-overload chose. tys are
+  ; the argument types (a placeholder for a bare fn) and codes their codes (a deferred-fn for a bare
+  ; fn). Most calls are closed already and use the conversions from resolve-overload. When some
+  ; type argument is still open (see infer-targs), the bare fns fix it, and the arguments are then
+  ; converted to the closed parameter types.
+  (define (finish-call stx tys codes convs m)
+    (define targs (clr-method-targs m))
+    (cond
+      [(not (memv #f targs))
+       (values m (finish-args codes convs (clr-method-params m)))]
+      [else
+       (define slots (list->vector targs))
+       (define compiled
+         (for/list ([c (in-list codes)] [t (in-list tys)] [p (in-list (clr-method-params m))])
+           (if (deferred-fn? c)
+               (let-values ([(fty fcode) (compile-partial-fn (deferred-fn-stx c) p slots)])
+                 (list fty fcode))
+               (list t c))))
+       (define open
+         (for/list ([s (in-vector slots)] [i (in-naturals)] #:unless s) i))
+       (unless (null? open)
+         (raise-syntax-error 'tui (format "cannot infer the type arguments of ~a"
+                                          (clr-method-name m))
+                             stx))
+       (define m* (instantiate-method m (vector->list slots)))
+       (values
+        m*
+        (append*
+         (for/list ([cl (in-list compiled)] [p (in-list (clr-method-params m*))])
+           (define c (coercion (car cl) p))
+           (unless c
+             (raise-syntax-error 'tui (format "argument has type ~a, expected ~a"
+                                              (tui-type->string (car cl)) (tui-type->string p))
+                                 stx))
+           (append (cadr cl) (cdr c)))))]))
+
   ;; Tui functions: (define (f [x : T] ...) : R body ...+). The binding of f holds its declared
   ;; signature as syntax; types are resolved when used, after the module's references are set.
   (struct tui-fun (name params ret)
@@ -302,9 +401,9 @@
                              def)]))
 
   ; Compiles one method body. binds are (id kind index type), parent is the enclosing method of
-  ; a lambda (#f for a method), and owner is the lambda's class (#f for a method). Returns the
-  ; instructions, with the return conversion and ret, and the mctx that holds the locals and the
-  ; lambda's env.
+  ; a lambda (#f for a method), and owner is the lambda's class (#f for a method). rty is the
+  ; return type, or #f to return the body's type. Returns the instructions, with the return
+  ; conversion and ret, the mctx that holds the locals and the lambda's env, and the return type.
   (define (compile-body stx binds body rty parent owner)
     (define m (new-mctx parent))
     (parameterize ([current-mctx m])
@@ -332,10 +431,11 @@
       (define n (length body))
       (define tail-body
         (for/list ([b (in-list body)] [i (in-naturals 1)])
-          (if (and (= i n) (not (eq? rty 'void))) (syntax-property b 'tui-expected rty) b)))
+          (if (and (= i n) rty (not (eq? rty 'void))) (syntax-property b 'tui-expected rty) b)))
       (define-values (bty code) (tc/bind cell-binds #`(tui-begin #,@tail-body)))
       (define ret-code
         (cond
+          [(not rty) '()]
           [(eq? rty 'void) (if (eq? bty 'void) '() '((pop)))]
           [(coercion bty rty) => cdr]
           [else (raise-syntax-error 'tui (format "function returns ~a but its body has type ~a"
@@ -347,7 +447,7 @@
                    (list '(ldarg.0)
                          `(ldfld ,owner ,(env-field k) ,(env-field-type (car e)))
                          (var-instr 'st 'local (cdr e))))))
-      (values (append env-code arg-code code ret-code '((ret))) m)))
+      (values (append env-code arg-code code ret-code '((ret))) m (or rty bty))))
 
   (define (local-il t)
     (if (cell-of? t) `(szarray ,(tui-type->il (cell-of-type t))) (tui-type->il t)))
@@ -359,7 +459,7 @@
     (define-values (name pnames ptypes ret body) (fun-header def))
     (define ptys (map ann->type ptypes))
     (define rty (ann->type ret))
-    (define-values (code m)
+    (define-values (code m _rty)
       (run-passes
        (λ ()
          (compile-body def (for/list ([p pnames] [t ptys] [i (in-naturals)]) (list p 'arg i t))
@@ -376,7 +476,7 @@
     (syntax-parse def
       [(_ name:id (~datum :) t:id e)
        (define rty (ann->type #'t))
-       (define-values (code m)
+       (define-values (code m _rty)
          (run-passes
           (λ ()
             (parameterize ([value-scope (map syntax-e earlier)])
@@ -397,12 +497,6 @@
        `((call ,t (Program) ,(value-init-name name) ())
          (stsfld Program ,name ,t)))))
 
-  ; Whether the class type t derives from System.MulticastDelegate.
-  (define (delegate-type? t)
-    (let loop ([b (base-type t)])
-      (and b (or (and (equal? (caddr b) "System") (equal? (cadddr b) "MulticastDelegate"))
-                 (loop (base-type b))))))
-
   ; The parameter and return types of the Invoke method of delegate type t.
   (define (delegate-signature stx t)
     (unless (delegate-type? t)
@@ -414,27 +508,105 @@
     (define m (car (car groups)))
     (values (clr-method-params m) (clr-method-ret m)))
 
+  ; The type that calls in body fix for each parameter in pnames, or #f. A parameter is fixed when
+  ; it is a direct argument of a call (Type.Method arg ...) or (.Method recv arg ...) whose name and
+  ; arity have exactly one overload, that is not generic and has a closed type at that position.
+  ; Nested fn, let, let*, letrec and define are not scanned, since their binders could shadow.
+  (define (body-param-types pnames body)
+    (define found (make-vector (length pnames) #f))
+    (define (param-index id)
+      (for/first ([p (in-list pnames)] [i (in-naturals)] #:when (free-identifier=? p id)) i))
+    ; The overloads of a call that take n arguments, from the first type in the base chain that has
+    ; any, as hiding would leave them.
+    (define (arity-overloads groups n)
+      (define (of-n g) (filter (λ (m) (= (length (clr-method-params m)) n)) g))
+      (define hit (for/first ([g (in-list groups)] #:when (pair? (of-n g))) (of-n g)))
+      (or hit '()))
+    ; The candidate overloads of a call, and the argument expressions that line up with their
+    ; parameters. Any failure to look a call up means there is nothing to learn from it.
+    (define (call-candidates head args)
+      (define name (symbol->string (syntax-e head)))
+      (with-handlers ([exn:fail? (λ (_) (cons '() '()))])
+        (cond
+          [(regexp-match? #rx"<" name) (cons '() '())]
+          [(regexp-match #rx"^\\.([^.]+)$" name)
+           => (λ (m)
+                (define recv (and (pair? args) (car args)))
+                (define v (and recv (identifier? recv) (syntax-local-value recv (λ () #f))))
+                (define t (and (tui-var? v) (tui-var-type v)))
+                (cond
+                  [(not t) (cons '() '())]
+                  [else
+                   (define owner (if (value-type? t) 'object t))
+                   (define rest (cdr args))
+                   (cons (arity-overloads (find-instance-methods owner (cadr m)) (length rest))
+                         rest)]))]
+          [(regexp-match #rx"^(.+)\\.([^.]+)$" name)
+           => (λ (m)
+                (cons (arity-overloads (list (find-static-methods (cadr m) (caddr m)))
+                                       (length args))
+                      args))]
+          [else (cons '() '())])))
+    (define (note-call! head args)
+      (define c (call-candidates head args))
+      (define cands (car c))
+      (when (and (= (length cands) 1) (zero? (clr-method-arity (car cands))))
+        (for ([a (in-list (cdr c))] [t (in-list (clr-method-params (car cands)))])
+          (define i (and (identifier? a) (param-index a)))
+          (when (and i (not (vector-ref found i)) (not (has-mvar? t)))
+            (vector-set! found i t)))))
+    (define (scan e)
+      (define xs (syntax->list e))
+      (when (and xs (pair? xs))
+        (define head (car xs))
+        (unless (and (identifier? head) (memq (syntax-e head) '(fn let let* letrec define)))
+          (when (identifier? head) (note-call! head (cdr xs)))
+          (for-each scan xs))))
+    (for-each scan body)
+    (vector->list found))
+
   ; (fn Delegate (param ...) body ...+). The body is the Invoke method of a generated class. The
   ; class has one field per cell that the body reads, and an instance of it is the delegate's
-  ; target. dt is the delegate type.
-  (define (compile-lambda stx dt pnames body)
-    (define-values (ptys rty) (delegate-signature stx dt))
-    (unless (= (length pnames) (length ptys))
-      (raise-syntax-error 'tui (format "fn has ~a parameters but ~a takes ~a"
-                                       (length pnames) (tui-type->string dt) (length ptys))
-                          stx))
+  ; target. dt is the delegate type, or #f when there is none, in which case every parameter is
+  ; annotated and the delegate is Func or Action of the body's type. params are (id . type-or-#f).
+  (define (compile-lambda stx dt params body)
+    (define pnames (map car params))
+    (define anns (map cdr params))
+    (define-values (dt0 ptys rty)
+      (cond
+        [dt
+         (define-values (ptys rty) (delegate-signature stx dt))
+         (unless (= (length pnames) (length ptys))
+           (raise-syntax-error 'tui (format "fn has ~a parameters but ~a takes ~a"
+                                            (length pnames) (tui-type->string dt) (length ptys))
+                               stx))
+         (for ([p (in-list pnames)] [a (in-list anns)] [t (in-list ptys)])
+           (when (and a (not (equal? a t)))
+             (raise-syntax-error 'tui (format "parameter ~a is ~a but ~a takes ~a"
+                                              (syntax-e p) (tui-type->string a)
+                                              (tui-type->string dt) (tui-type->string t))
+                                 stx p)))
+         (values dt ptys rty)]
+        [else
+         (define anns* (for/list ([a (in-list anns)] [f (in-list (body-param-types pnames body))])
+                         (or a f)))
+         (unless (andmap values anns*)
+           (raise-syntax-error 'tui "fn without a delegate type needs an expected delegate type or annotated parameters"
+                               stx))
+         (values #f anns* #f)]))
     (define parent (current-mctx))
     (define cname (string->symbol (symbol->string (gensym 'closure))))
     (set-pass-lambdas! (current-pass) (add1 (pass-lambdas (current-pass))))
-    (define-values (code m)
+    (define-values (code m body-rty)
       (compile-body stx (for/list ([p pnames] [t ptys] [i (in-naturals 1)]) (list p 'arg i t))
                     body rty parent cname))
+    (define dt* (or dt0 (lambda-delegate stx ptys body-rty)))
     (if (pass-discovering? (current-pass))
-        (il dt '((ldnull)))
+        (il dt* '((ldnull)))
         (let ()
           (define env (mctx-env m))
           (define ils (map tui-type->il ptys))
-          (define ret-il (tui-type->il rty))
+          (define ret-il (tui-type->il body-rty))
           (define fields
             (for/list ([e (in-list env)] [k (in-naturals)])
               `(.field (public) ,(env-field-type (car e)) ,(env-field k))))
@@ -454,10 +626,26 @@
                        (list '(dup)
                              (var-instr 'ld 'local (cell-slot-in parent (car e)))
                              `(stfld ,cname ,(env-field k) ,(env-field-type (car e)))))))
-          (il dt `((newobj (,cname) ())
-                   ,@env-build
-                   (ldftn ,ret-il (,cname) Invoke ,ils)
-                   (newobj ,(owner->il dt) (object intptr)))))))
+          (il dt* `((newobj (,cname) ())
+                    ,@env-build
+                    (ldftn ,ret-il (,cname) Invoke ,ils)
+                    (newobj ,(owner->il dt*) (object intptr)))))))
+
+  ; The Func or Action type for a lambda with parameter types ptys and return type rty.
+  (define (lambda-delegate stx ptys rty)
+    (or (if (eq? rty 'void)
+            (generic-instance "System.Action" ptys)
+            (generic-instance "System.Func" (append ptys (list rty))))
+        (raise-syntax-error 'tui (format "fn cannot take ~a parameters" (length ptys)) stx)))
+
+  ; The (id . type-or-#f) pairs of a fn's parameter list, each either id or [id : type].
+  (define (lambda-params ps)
+    (for/list ([p (in-list ps)])
+      (syntax-parse p
+        [n:id (cons #'n #f)]
+        [[n:id (~datum :) t:id] (cons #'n (ann->type #'t))]
+        [_ (raise-syntax-error 'tui "expected a parameter name or [name : type]" p)])))
+
 
 
   ; The entry point. With print? the value of the last form, if any, is written to the console.
@@ -755,7 +943,7 @@
           (raise-syntax-error 'tui (format "unknown type argument ~a" s) head))))
 
   (define (compile-static-call stx head type-name method-name args explicit)
-    (define-values (tys codes) (tc* args))
+    (define-values (tys codes) (tc-args args))
     (define ms (with-clr head (λ () (find-static-methods type-name method-name))))
     (unless ms (raise-syntax-error 'tui (format "unknown type ~a" type-name) head))
     (when (null? ms)
@@ -764,14 +952,15 @@
     (define-values (m convs)
       (with-clr stx (λ () (resolve-overload (list ms) tys
                                             (format "~a.~a" type-name method-name) explicit))))
-    (il (clr-method-ret m) (append (args-code codes convs) (list (clr-call-instr 'call m)))))
+    (define-values (m* arg-code) (finish-call stx tys codes convs m))
+    (il (clr-method-ret m*) (append arg-code (list (clr-call-instr 'call m*)))))
 
   ; A value-type receiver is boxed and dispatched through System.Object (ToString and friends).
   (define (compile-instance-call stx head method-name args explicit)
     (when (null? args)
       (raise-syntax-error 'tui (format ".~a needs a receiver" method-name) stx))
     (define-values (rty rcode) (tc (car args)))
-    (define-values (tys codes) (tc* (cdr args)))
+    (define-values (tys codes) (tc-args (cdr args)))
     (define-values (owner recv-code)
       (cond
         [(value-type? rty) (values 'object (append rcode `((box ,(tui-type->il rty)))))]
@@ -786,8 +975,10 @@
       (with-clr stx (λ () (resolve-overload groups tys
                                             (format "~a.~a" (tui-type->string owner) method-name)
                                             explicit))))
-    (il (clr-method-ret m)
-        (append recv-code (args-code codes convs) (list (clr-call-instr 'callvirt m))))))
+    (define-values (m* arg-code) (finish-call stx tys codes convs m))
+    (il (clr-method-ret m*)
+        (append recv-code arg-code
+                (list (clr-call-instr 'callvirt m*))))))
 
 ; (new Type arg ...) calls a public constructor.
 (define-tui-form (tui-new stx)
@@ -795,13 +986,14 @@
     [(_ type:id arg ...)
      (define t (class-of (ann->type #'type)))
      (unless (pair? t) (raise-syntax-error 'tui "new needs a class type" #'type))
-     (define-values (tys codes) (tc* (syntax->list #'(arg ...))))
+     (define-values (tys codes) (tc-args (syntax->list #'(arg ...))))
      (define-values (m convs)
        (with-clr stx (λ () (resolve-overload (list (find-constructors t)) tys
                                              (format "new ~a" (tui-type->string t))))))
+     (define-values (m* arg-code) (finish-call stx tys codes convs m))
      (il (ann->type #'type)
-         (append (args-code codes convs)
-                 `((newobj ,(owner->il t) ,(clr-method-il-params m)))))]))
+         (append arg-code
+                 `((newobj ,(owner->il t) ,(clr-method-il-params m*)))))]))
 
 ; (list-of e ...) builds a System.Collections.Generic.List<T>, where T is the type of the first
 ; element. The expansion is looked up in the type environment: the List definition is instantiated
@@ -890,17 +1082,18 @@
         (il 'void (store-var v #'x (tc/expect #'e (tui-var-type v))))])]))
 
 ; (fn Delegate (param ...) body ...+), or (fn (param ...) body ...+) when the expected type of the
-; form (set by tc/expect as 'tui-expected) is the delegate type.
+; form (set by tc/expect as 'tui-expected) is the delegate type. A param is id or [id : type]. With
+; no delegate type, every param is annotated and the delegate is Func or Action of the body type.
 (define-tui-form (tui-fn stx)
   (syntax-parse stx
-    [(_ dt:id (p:id ...) body ...+)
-     (compile-lambda stx (ann->type #'dt) (syntax->list #'(p ...)) (syntax->list #'(body ...)))]
-    [(_ (p:id ...) body ...+)
-     (define expected (syntax-property stx 'tui-expected))
-     (unless expected
-       (raise-syntax-error 'tui "fn without a delegate type needs an expected delegate type" stx))
-     (compile-lambda stx expected (syntax->list #'(p ...)) (syntax->list #'(body ...)))]
+    [(_ dt:id (p ...) body ...+)
+     (compile-lambda stx (ann->type #'dt) (lambda-params (syntax->list #'(p ...)))
+                     (syntax->list #'(body ...)))]
+    [(_ (p ...) body ...+)
+     (compile-lambda stx (syntax-property stx 'tui-expected) (lambda-params (syntax->list #'(p ...)))
+                     (syntax->list #'(body ...)))]
     [_ (raise-syntax-error 'tui "expected (fn [Delegate] (param ...) body ...+)" stx)]))
+
 
 (define-tui-form (tui-if stx)
   (syntax-parse stx

@@ -6,8 +6,7 @@
 ; Tui types are plain datums so they can be quoted into syntax and stored in bindings:
 ;   void bool char int32 int64 float64 string object
 ;   (class "AssemblyName" "Namespace" "Name" (arg ...))   any other reference type, with its type arguments
-(require racket/string racket/promise
-         rangi/src/types/canon rangi/src/types/desc rangi/src/types/reference
+(require racket/string racket/promise racket/list         rangi/src/types/canon rangi/src/types/desc rangi/src/types/reference
          (only-in rangi/src/types/provider make-env make-declaration-provider prefer-local-policy
                   first-match-policy env-type [resolve-type-name find-type-name]))
 (provide reference-assemblies-dir mscorlib-path
@@ -15,7 +14,9 @@
          resolve-type-name generic-instance string->tui-type split-type-args class-of tui-type->il
          tui-type->string value-type? numeric-type? coercion
          (struct-out clr-method) find-static-methods find-instance-methods find-constructors
-         resolve-overload owner->il base-type supertypes type-methods)
+         resolve-overload owner->il base-type supertypes type-methods
+         lambda-placeholder lambda-placeholder? delegate-type?
+         class-args has-mvar? erase-mvars delegate-param-args bind-type subst-mvars instantiate-method)
 
 (define reference-assemblies-dir
   "C:/Program Files (x86)/Reference Assemblies/Microsoft/Framework/.NETFramework/v4.7.1/")
@@ -189,12 +190,18 @@
 (define (value-type? t) (and (memq t value-types) #t))
 (define (numeric-type? t) (and (memq t '(int32 int64 float64)) #t))
 
+; The type of a bare fn argument during overload resolution: a fn of n parameters, whose delegate
+; type is only known once the overload is chosen.
+(define (lambda-placeholder n) (list 'lambda n))
+(define (lambda-placeholder? t) (and (pair? t) (eq? (car t) 'lambda)))
+
 (define (tui-type->string t)
   (cond
     [(and (pair? t) (eq? (car t) 'class))
      (define args (class-args t))
      (string-append (full-name (caddr t) (cadddr t))
                     (if (null? args) "" (format "<~a>" (string-join (map tui-type->string args) ", "))))]
+    [(lambda-placeholder? t) (format "fn/~a" (cadr t))]
     [else (symbol->string t)]))
 
 (define (full-name ns name) (if (equal? ns "") name (string-append ns "." name)))
@@ -357,40 +364,135 @@
                           (type-methods t)))
        (loop (base-type t) (if (null? ms) acc (cons ms acc)))])))
 
+; Whether t is a delegate type (a class deriving from System.MulticastDelegate).
+(define (delegate-type? t)
+  (and (pair? t) (eq? (car t) 'class)
+       (let loop ([b (base-type t)])
+         (and b (or (and (equal? (caddr b) "System") (equal? (cadddr b) "MulticastDelegate"))
+                    (loop (base-type b)))))))
+
+; The number of parameters of the Invoke method of delegate type t, or #f if t is not a delegate.
+(define (delegate-arity t)
+  (and (delegate-type? t)
+       (let ([groups (find-instance-methods t "Invoke")])
+         (and (pair? groups) (length (clr-method-params (car (car groups))))))))
+
+; A placeholder matches a delegate of the same arity. Its conversion is applied once the overload
+; is chosen, so it has no instructions here.
+(define (placeholder-coercion from to)
+  (and (eqv? (delegate-arity (erase-mvars to)) (cadr from)) (cons 0 '())))
+
+; The coercion of an argument of type from to parameter type to, as coercion, or as a placeholder
+; match when from is a bare fn.
+(define (arg-coercion from to)
+  (if (lambda-placeholder? from) (placeholder-coercion from to) (coercion from to)))
+
 (define (find-constructors t)
   (filter (λ (m) (and (not (clr-method-static? m)) (equal? (clr-method-name m) ".ctor")))
           (type-methods t)))
 
+; Whether type t mentions a method type parameter that is not yet fixed.
+(define (has-mvar? t)
+  (cond
+    [(and (pair? t) (eq? (car t) 'mvar)) #t]
+    [(pair? t) (ormap has-mvar? t)]
+    [else #f]))
+
+; The indexes of the method type parameters that t mentions.
+(define (mvars-of t)
+  (cond
+    [(and (pair? t) (eq? (car t) 'mvar)) (list (cadr t))]
+    [(pair? t) (append-map mvars-of t)]
+    [else '()]))
+
+; t with each unbound (mvar n) replaced by object, so that its shape can be examined.
+(define (erase-mvars t)
+  (cond
+    [(and (pair? t) (eq? (car t) 'mvar)) 'object]
+    [(and (pair? t) (eq? (car t) 'class))
+     (list 'class (cadr t) (caddr t) (cadddr t) (map erase-mvars (class-args t)))]
+    [else t]))
+
+; For delegate type d, whose arguments may hold unbound (mvar n): the argument index that each
+; parameter of its Invoke method is, or #f for a parameter that is not a plain argument.
+(define (delegate-param-args d)
+  (define groups (find-instance-methods (erase-mvars d) "Invoke"))
+  (and (pair? groups)
+       (for/list ([il (in-list (clr-method-il-params (car (car groups))))])
+         (let ([s (and (symbol? il) (symbol->string il))])
+           (and s (regexp-match? #rx"^![0-9]+$" s) (string->number (substring s 1)))))))
+
+; The generic definition a class type instantiates: its assembly, namespace and name.
+(define (generic-key t) (list (cadr t) (caddr t) (cadddr t)))
+
+; The supertype of a (a class type or string, or a primitive, which has none) that has the generic
+; definition of p, or #f.
+(define (matching-supertype a p)
+  (define ca (class-of a))
+  (and (pair? ca) (eq? (car ca) 'class)
+       (for/first ([s (in-list (cons ca (supertypes ca)))]
+                   #:when (and (equal? (generic-key s) (generic-key p))
+                               (= (length (class-args s)) (length (class-args p)))))
+         s)))
+
+; Matches a parameter type p against an argument type a, binding the method type parameters in
+; slots. A generic instance parameter matches the argument's supertype of the same definition, so
+; List<int32> fixes !!0 in IEnumerable<!!0>. Returns #f on a conflict. A lambda placeholder binds
+; nothing.
+(define (bind-type p a slots)
+  (cond
+    [(lambda-placeholder? a) #t]
+    [(and (pair? p) (eq? (car p) 'mvar))
+     (define i (cadr p))
+     (cond [(not (vector-ref slots i)) (vector-set! slots i a) #t]
+           [else (equal? (vector-ref slots i) a)])]
+    [(and (pair? p) (eq? (car p) 'class) (has-mvar? p))
+     (define s (matching-supertype a p))
+     ; An argument that is not an instance of p is left to the coercion check once closed.
+     (or (not s)
+         (for/and ([pp (in-list (class-args p))] [sa (in-list (class-args s))])
+           (bind-type pp sa slots)))]
+    [else #t]))
+
+; Whether type parameter i occurs in some bare fn parameter and in no other parameter, so that the
+; body of that fn can fix it (see finish-call).
+(define (lambda-only? i params arg-types)
+  (define (occurs? p) (memv i (mvars-of p)))
+  (and (for/or ([p (in-list params)] [a (in-list arg-types)])
+         (and (lambda-placeholder? a) (occurs? p)))
+       (for/and ([p (in-list params)] [a (in-list arg-types)])
+         (or (lambda-placeholder? a) (not (occurs? p))))))
+
 ; The type arguments of a generic method call, or #f when they cannot be fixed. Explicit ones are
 ; used as given. Otherwise a parameter that is exactly !!n takes the type of its argument, and every
 ; !!n must be fixed that way with one type. Other parameters are checked by coercion once closed.
+; A type argument that only bare fn parameters mention is left #f, to be fixed by the fn's body.
 (define (infer-targs m arg-types explicit)
   (define k (clr-method-arity m))
   (cond
     [(pair? explicit) (and (= (length explicit) k) explicit)]
     [else
+     (define params (clr-method-params m))
      (define slots (make-vector k #f))
-     (define consistent?
-       (for/and ([p (in-list (clr-method-params m))] [a (in-list arg-types)])
-         (cond
-           [(and (pair? p) (eq? (car p) 'mvar))
-            (define i (cadr p))
-            (cond [(not (vector-ref slots i)) (vector-set! slots i a) #t]
-                  [else (equal? (vector-ref slots i) a)])]
-           [else #t])))
-     (and consistent? (andmap values (vector->list slots)) (vector->list slots))]))
+     (and (for/and ([p (in-list params)] [a (in-list arg-types)]) (bind-type p a slots))
+          (for/and ([i (in-range k)])
+            (or (vector-ref slots i) (lambda-only? i params arg-types)))
+          (vector->list slots))]))
 
-; The closed method at type arguments targs: each (mvar n) becomes the nth argument.
+; t with each (mvar n) replaced by the nth of targs, where that is not #f.
+(define (subst-mvars t targs)
+  (cond
+    [(and (pair? t) (eq? (car t) 'mvar)) (or (list-ref targs (cadr t)) t)]
+    [(and (pair? t) (eq? (car t) 'class))
+     (list 'class (cadr t) (caddr t) (cadddr t) (map (λ (a) (subst-mvars a targs)) (class-args t)))]
+    [else t]))
+
+; The closed method at type arguments targs: each (mvar n) becomes the nth argument. A #f
+; argument leaves its (mvar n) in place.
 (define (instantiate-method m targs)
-  (define (subst t)
-    (cond
-      [(and (pair? t) (eq? (car t) 'mvar)) (list-ref targs (cadr t))]
-      [(and (pair? t) (eq? (car t) 'class))
-       (list 'class (cadr t) (caddr t) (cadddr t) (map subst (class-args t)))]
-      [else t]))
   (struct-copy clr-method m
-               [params (map subst (clr-method-params m))]
-               [ret (subst (clr-method-ret m))]
+               [params (map (λ (p) (subst-mvars p targs)) (clr-method-params m))]
+               [ret (subst-mvars (clr-method-ret m) targs)]
                [targs targs]))
 
 ; Picks the cheapest applicable overload. groups is a list of candidate lists; earlier groups win
@@ -406,9 +508,9 @@
   (define (score m)
     (define c (close m))
     (and c (= (length (clr-method-params c)) (length arg-types))
-         (let ([cs (map coercion arg-types (clr-method-params c))])
+         (let ([cs (map arg-coercion arg-types (clr-method-params c))])
            (and (andmap values cs)
-                (list (apply + (map car cs)) c (map cdr cs))))))
+                (list (apply + (map car cs)) c (map cdr cs) (positive? (clr-method-arity m)))))))
   (let loop ([groups groups])
     (cond
       [(null? groups)
@@ -420,7 +522,10 @@
          [(null? scored) (loop (cdr groups))]
          [else
           (define best (apply min (map car scored)))
-          (define winners (filter (λ (x) (= (car x) best)) scored))
+          ; Among equally good candidates a non-generic method wins, as in C#.
+          (define equal-best (filter (λ (x) (= (car x) best)) scored))
+          (define plain (filter (λ (x) (not (list-ref x 3))) equal-best))
+          (define winners (if (null? plain) equal-best plain))
           (when (> (length winners) 1)
             (error 'tui "ambiguous call to ~a with (~a)" describe
                    (string-join (map tui-type->string arg-types) " ")))
