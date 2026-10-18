@@ -36,3 +36,10 @@
 (define (missing [s : string]) : bool (null? s))
 (Console.WriteLine (missing null))
 (Console.WriteLine (missing "x"))
+
+; typeof takes a type name and gives its System.Type at run time. It works for primitives, classes
+; without type arguments and local records, and is a syntax error for void, generic instances and arrays.
+(record Point [x : int32] [y : int32])
+(Console.WriteLine (.get_FullName (typeof int32)))
+(Console.WriteLine (.get_FullName (typeof System.Text.StringBuilder)))
+(Console.WriteLine (.get_FullName (typeof Point)))

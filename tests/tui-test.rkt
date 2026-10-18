@@ -240,7 +240,7 @@
 
 (test-case "default-of takes a type name and expands to its default value"
   (check-equal? (run-example "types.rkt")
-                '("0" "False" "0" "0" "0" "System.Collections.Generic.List<int32>" "True" "False")))
+                '("0" "False" "0" "0" "0" "System.Collections.Generic.List<int32>" "True" "False" "System.Int32" "System.Text.StringBuilder" "Point")))
 
 (test-case "type-name-of expands to the Tui name of its argument's type"
   (define types-path (path->string (build-path examples "types.rkt")))
@@ -257,6 +257,16 @@
   (check-regexp-match #rx"got System.Console"
                       (tui-error `(require (file ,types-path)) '(default-of System.Console)))
   (check-regexp-match #rx"unknown type" (tui-error `(require (file ,types-path)) '(default-of Nope))))
+
+(test-case "typeof gives the System.Type of a primitive, class or local record"
+  (check-equal? (run-tui '(Console.WriteLine (.get_FullName (typeof int64)))
+                        '(Console.WriteLine (.get_FullName (typeof System.Text.StringBuilder))))
+               '("System.Int64" "System.Text.StringBuilder")))
+
+(test-case "typeof rejects void and types with type arguments"
+  (check-regexp-match #rx"typeof needs a type, got void" (tui-error '(typeof void)))
+  (check-regexp-match #rx"typeof supports primitives and classes without type arguments, got System.Collections.Generic.List<int32>"
+                     (tui-error '(typeof System.Collections.Generic.List<int32>))))
 
 (test-case "sum-of reads the element type from the closed List's metadata"
   (check-regexp-match #rx"sum-of needs a list of int32 or string elements, got bool"

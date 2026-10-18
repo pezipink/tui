@@ -777,7 +777,7 @@ and run `raco make main.rkt`.
 | (inline tests) | generic parameters bound from a `List<T>` and from a delegate variable | `generic parameters are inferred from list and delegate variable arguments` |
 | (inline tests) | type arguments as `_` or omitted at the end, and the errors for too many, uninferrable and conflicting ones | `type arguments may be _ or omitted at the end, and the rest are inferred` |
 | `macros.rkt` | hygienic macros | `Tui macros are hygienic` |
-| `types.rkt` | `default-of`, `type-name-of`, `null?` on a null argument | `default-of takes a type name ...`, `type-name-of expands ...`, `null is typed from the expected type and works as an argument` |
+| `types.rkt` | `default-of`, `type-name-of`, `null?` on a null argument, `typeof` | `default-of takes a type name ...`, `type-name-of expands ...`, `null is typed from the expected type and works as an argument`, `typeof gives the System.Type of a type name` |
 | (inline tests) | `null-of` as a typed null in `let` and `set!`, and its rejections | `null-of declares a typed null where there is no expected type` |
 | `lists.rkt` | `list-of`, `sum-of`, `typedList` built from the type-pattern language | `the list-of example runs`, `sum-of reads the element type ...`, `typedList no longer takes a dictionary's value type ...` |
 | `type-patterns.rkt` | `define-type-syntax-class`, `type-match`, `type-matches?`: generics (open and closed), nested `<:`, named patterns, members and static members, method type parameters, combinators, predicates, `exactly` | `the type-patterns example exercises generic, member, named and combinator patterns` |
