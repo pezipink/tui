@@ -99,6 +99,30 @@
   (check-not-false (member "GetHashCode" dbl))
   (check-equal? (names-of "no-such-type-or-value") '()))
 
+(test-case "a static field of a class is a field, and an enum's literal fields are its members"
+  (define (entry receiver name)
+    (findf (λ (e) (equal? (hash-ref e 'name) name))
+           (hash-ref (reply "members" 'offset (offset-of "(.get_Count") 'receiver receiver) 'members)))
+  (check-equal? (hash-ref (entry "System.Int32" "MaxValue") 'kind) "field")
+  (check-equal? (hash-ref (entry "System.Int32" "MaxValue") 'type) "int32")
+  (check-equal? (hash-ref (entry "System.DayOfWeek" "Monday") 'kind) "enum-member")
+  (check-false (entry "System.DayOfWeek" "value__") "the underlying value__ field is not a member"))
+
+(test-case "an array value lists its Length property and the members of System.Array"
+  (define arr-file "arr-test.tui")
+  (define arr-src "#lang tui\n(let ([xs (array int32 1 2 3)])\n  (aref xs 0))\n")
+  (handle-request (hasheq 'id 4 'op "scopes" 'file arr-file 'text arr-src))
+  (define ms
+    (hash-ref (handle-request
+               (hasheq 'id 5 'op "members" 'file arr-file 'receiver "xs"
+                       'offset (caar (regexp-match-positions #rx"\\(aref" arr-src))))
+              'members))
+  (check-not-false (findf (λ (e) (and (equal? (hash-ref e 'name) "Length")
+                                      (equal? (hash-ref e 'kind) "property")
+                                      (equal? (hash-ref e 'type) "int32")))
+                          ms))
+  (check-not-false (findf (λ (e) (equal? (hash-ref e 'name) "GetType")) ms)))
+
 (test-case "requests for an unknown file or op are reported, not raised"
   (check-false (hash-ref (handle-request (hasheq 'id 2 'op "names" 'file "never-sent.tui" 'offset 0)) 'ok))
   (check-false (hash-ref (handle-request (hasheq 'id 3 'op "bogus" 'file file)) 'ok)))

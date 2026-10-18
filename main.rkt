@@ -20,6 +20,8 @@
                      [tui-record record]
                      [tui-while while] [tui-begin begin] [tui-and and] [tui-or or] [tui-not not]
                      [tui-new new] [tui-list-of list-of] [tui-fn fn]
+                     [tui-array array] [tui-new-array new-array] [tui-aref aref]
+                     [tui-for-each for-each]
                      [tui-+ +] [tui-- -] [tui-* *] [tui-/ /] [tui-% %]
                      [tui-< <] [tui-> >] [tui-<= <=] [tui->= >=] [tui-= =]
                      [tui-null null] [tui-null-of null-of] [tui-null? null?])
@@ -310,9 +312,13 @@
        ctx))
     (tc (internal-definition-context-introduce ctx body 'add) ctx))
 
-  ; A type annotation (an identifier) to a Tui type.
+  ; A type annotation (an identifier) to a Tui type. A quoted annotation such as |int32[]| or
+  ; |List<int32>| is parsed from its text.
   (define (ann->type stx)
-    (or (and (identifier? stx) (resolve-type-name stx))
+    (define text (and (identifier? stx) (symbol->string (syntax-e stx))))
+    (or (if (and text (regexp-match? #rx"[][<>]" text))
+            (with-clr stx (λ () (string->tui-type text)))
+            (and (identifier? stx) (resolve-type-name stx)))
         (raise-syntax-error 'tui "unknown type" stx)))
 
   ; Errors from the CLR layer become syntax errors at stx.
@@ -1118,8 +1124,9 @@
 (define-tui-form (tui-top stx)
   (syntax-parse stx
     [(_ . id)
-     ; A bare a.b reads a local's property (xs.Count) or a static property (Console.Out).
-     (if (dotted-match (symbol->string (syntax-e #'id)))
+     ; A bare a.b reads a local's property (xs.Count) or a static property or field (Console.Out,
+     ; System.Globalization.NumberStyles.Integer).
+     (if (regexp-match? #rx"\\." (symbol->string (syntax-e #'id)))
          #'(tui-app id)
          (raise-syntax-error 'tui "unbound identifier" #'id))]))
 
@@ -1178,7 +1185,12 @@
                                           args)
                                     explicit))]
        [(regexp-match #rx"^(.+)\\.([^.]+)$" name)
-        => (λ (m) (compile-static-call stx #'head (cadr m) (caddr m) args explicit))]
+        => (λ (m)
+             (define field (and (null? args)
+                                (with-clr #'head (λ () (find-static-field (cadr m) (caddr m))))))
+             (if field
+                 (static-field-read field)
+                 (compile-static-call stx #'head (cadr m) (caddr m) args explicit)))]
        [else (raise-syntax-error 'tui "unbound function" #'head)])]
     [(_ head . _) (raise-syntax-error 'tui "only named functions can be called" stx #'head)]))
 
@@ -1240,6 +1252,15 @@
                                             (format "~a.~a" type-name method-name) explicit))))
     (define-values (m* arg-code) (finish-call stx tys codes convs m))
     (il (clr-method-ret m*) (append arg-code (list (clr-call-instr 'call m*)))))
+
+  ; The value of a public static field. A literal (a constant, or an enum member) is pushed as its
+  ; value; any other field is loaded from its owner.
+  (define (static-field-read f)
+    (define ty (clr-field-type f))
+    (il ty (if (clr-field-literal? f)
+               (literal-instructions ty (clr-field-value f))
+               (list `(ldsfld ,(owner->il (clr-field-owner f)) ,(string->symbol (clr-field-name f))
+                              ,(tui-type->il ty))))))
 
   ; A primitive receiver is boxed and dispatched through System.Object (ToString and friends). A
   ; struct or enum receiver is unboxed to a managed pointer, the `this` its own methods take. A
@@ -1325,6 +1346,144 @@
      (define rest-codes (for/list ([x (in-list (syntax->list #'(e ...)))]) (tc/expect x elem)))
      (list-code stx (cons c0 rest-codes) elem)]))
 
+; (array T e ...) builds a single-dimensional array of T, holding the elements in order. Each
+; element is checked against T.
+(define-tui-form (tui-array stx)
+  (syntax-parse stx
+    [(_ et:id e ...)
+     (define elem (ann->type #'et))
+     (define elem-il (tui-type->il elem))
+     (define stores
+       (for/list ([x (in-list (syntax->list #'(e ...)))] [k (in-naturals)])
+         (append '((dup)) `((ldc.i4 ,k)) (tc/expect x elem) `((stelem ,elem-il)))))
+     (il (list 'szarray elem)
+         (append `((ldc.i4 ,(length stores)) (newarr ,elem-il)) (append* stores)))]))
+
+; (new-array T n) builds an array of n elements of T, each set to the default value.
+(define-tui-form (tui-new-array stx)
+  (syntax-parse stx
+    [(_ et:id n)
+     (define elem (ann->type #'et))
+     (il (list 'szarray elem) (append (tc/expect #'n 'int32) `((newarr ,(tui-type->il elem)))))]))
+
+; (aref a i) reads element i of the array a.
+(define-tui-form (tui-aref stx)
+  (syntax-parse stx
+    [(_ a i)
+     (define-values (aty acode) (tc #'a))
+     (unless (szarray-type? aty)
+       (raise-syntax-error 'tui (format "~a is not an array" (tui-type->string aty)) #'a))
+     (define elem (szarray-elem aty))
+     (il elem (append acode (tc/expect #'i 'int32) `((ldelem ,(tui-type->il elem)))))]))
+
+; The length of the array a, as an int32. Used by the lowering of for-each.
+(define-tui-form (tui-alen stx)
+  (syntax-parse stx
+    [(_ a)
+     (define-values (aty acode) (tc #'a))
+     (il 'int32 (append acode '((ldlen) (conv.i4))))]))
+
+; (tui-as T e) checks that e converts to T, and has type T. The error is reported at T, which
+; is the loop variable's annotation.
+(define-tui-form (tui-as stx)
+  (syntax-parse stx
+    [(_ t:id e)
+     (define to (ann->type #'t))
+     (define-values (ty code) (tc #'e))
+     (define c (coercion ty to))
+     (unless c
+       (raise-syntax-error 'tui (format "type mismatch: expected ~a, got ~a"
+                                        (tui-type->string to) (tui-type->string ty))
+                           #'t))
+     (il to (append code (cdr c)))]))
+
+(begin-for-syntax
+  ; A call of the instance method name on the enumerator en. owner is the type that declares the
+  ; method, or #f for en's own type. The result has the method's return type.
+  (define (enumerator-call stx en owner name)
+    (define-values (ty code) (tc en))
+    (define-values (m _c)
+      (with-clr stx (λ () (resolve-overload (find-instance-methods (or owner ty) name) '() name))))
+    (il (clr-method-ret m) (append code (list (clr-call-instr 'callvirt m)))))
+
+  ; The for-each expansion: a temporary holds the sequence, and the body runs with x bound to
+  ; each element in turn. anns is () or (T), the loop variable's annotation.
+  (define (lower-for-each stx x anns e bodies)
+    (define src (syntax-property (datum->syntax x (gensym 'src)) 'tui-expr e))
+    (quasisyntax/loc stx
+      (tui-let ([#,src #,e]) (tui-for-each-loop #,src #,x #,anns #,@bodies)))))
+
+; The IEnumerator<T> of a sequence, from GetEnumerator on IEnumerable<T>. An array implements
+; IEnumerable<T>, so it needs no conversion.
+(define-tui-form (tui-enumerator stx)
+  (syntax-parse stx
+    [(_ src)
+     (define-values (ty code) (tc #'src))
+     (define elem (enumerable-element ty))
+     (unless elem
+       (raise-syntax-error 'tui (format "for-each needs an array or IEnumerable<T>, got ~a"
+                                        (tui-type->string ty))
+                           #'src))
+     (define ienum (with-clr stx (λ () (generic-instance "System.Collections.Generic.IEnumerable"
+                                                         (list elem)))))
+     (define ienumr (with-clr stx (λ () (generic-instance "System.Collections.Generic.IEnumerator"
+                                                          (list elem)))))
+     (define-values (m _c)
+       (with-clr stx (λ () (resolve-overload (find-instance-methods ienum "GetEnumerator") '()
+                                             "GetEnumerator"))))
+     (il ienumr (append code (list (clr-call-instr 'callvirt m))))]))
+
+; MoveNext is declared on the non-generic IEnumerator, which IEnumerator<T> inherits.
+(define-tui-form (tui-enum-move stx)
+  (syntax-parse stx
+    [(_ en)
+     (enumerator-call stx #'en
+                      (with-clr stx (λ () (generic-instance "System.Collections.IEnumerator" '())))
+                      "MoveNext")]))
+
+(define-tui-form (tui-enum-current stx)
+  (syntax-parse stx
+    [(_ en) (enumerator-call stx #'en #f "get_Current")]))
+
+; (for-each [x e] body ...+) runs body for each element of e, with x bound to it. The loop
+; variable may be annotated, as in (for-each [x : T e] body ...+), and the annotation is checked.
+(define-tui-form (tui-for-each stx)
+  (syntax-parse stx
+    [(_ [x:id (~datum :) t:id e] body ...+) (lower-for-each stx #'x #'(t) #'e #'(body ...))]
+    [(_ [x:id e] body ...+) (lower-for-each stx #'x #'() #'e #'(body ...))]
+    [_ (raise-syntax-error 'tui "expected (for-each [x e] body ...+) or (for-each [x : T e] body ...+)"
+                           stx)]))
+
+; The loop itself, once the sequence is bound to src. An array is walked by index, and any other
+; sequence by its enumerator.
+(define-tui-form (tui-for-each-loop stx)
+  (syntax-parse stx
+    [(_ src:id x:id (t:id ...) body ...+)
+     (define ty (tui-var-type (syntax-local-value #'src)))
+     (define anns (syntax->list #'(t ...)))
+     (define (bind value)
+       (if (null? anns)
+           (quasisyntax/loc stx (tui-let ([x #,value]) body ...))
+           (quasisyntax/loc stx (tui-let ([x (tui-as #,(car anns) #,value)]) body ...))))
+     (cond
+       [(szarray-type? ty)
+        (define i (datum->syntax #'src (gensym 'i)))
+        (quasisyntax/loc stx
+          (tui-let ([#,i (tui-datum . 0)])
+            (tui-while (tui-< #,i (tui-alen src))
+              (tui-begin #,(bind #`(tui-aref src #,i))
+                         (tui-set! #,i (tui-+ #,i (tui-datum . 1)))))))]
+       [(enumerable-element ty)
+        (define en (datum->syntax #'src (gensym 'en)))
+        (quasisyntax/loc stx
+          (tui-let ([#,en (tui-enumerator src)])
+            (tui-while (tui-enum-move #,en)
+              #,(bind #`(tui-enum-current #,en)))))]
+       [else
+        (raise-syntax-error 'tui (format "for-each needs an array or IEnumerable<T>, got ~a"
+                                         (tui-type->string ty))
+                            (or (syntax-property #'src 'tui-expr) #'src))])]))
+
 (define-tui-form (tui-begin stx)
   (syntax-parse stx
     [(_) (il 'void '())]
@@ -1371,6 +1530,13 @@
 
 (define-tui-form (tui-set! stx)
   (syntax-parse stx
+    [(_ (h:id a i) e) #:when (free-identifier=? #'h #'tui-aref)
+     (define-values (aty acode) (tc #'a))
+     (unless (szarray-type? aty)
+       (raise-syntax-error 'tui (format "~a is not an array" (tui-type->string aty)) #'a))
+     (define elem (szarray-elem aty))
+     (il 'void (append acode (tc/expect #'i 'int32) (tc/expect #'e elem)
+                       `((stelem ,(tui-type->il elem)))))]
     [(_ x:id e)
      (define v (syntax-local-value #'x (λ () #f)))
      (define name (symbol->string (syntax-e #'x)))

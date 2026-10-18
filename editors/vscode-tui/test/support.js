@@ -44,6 +44,7 @@ class SnippetString {
 
 const CompletionItemKind = {
   Function: 'Function', Variable: 'Variable', Class: 'Class', Property: 'Property', Method: 'Method',
+  Field: 'Field', EnumMember: 'EnumMember',
 };
 
 function fakeVscode() {

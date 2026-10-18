@@ -28,7 +28,7 @@ function escapeSnippet(text) {
 // cursor lands inside the call. A method without parameters gets no cursor stop.
 function memberInsertText(receiver, member) {
   const target = escapeSnippet(`${receiver}.${member.name}`);
-  if (member.kind === 'property') return target;
+  if (member.kind === 'property' || member.kind === 'field' || member.kind === 'enum-member') return target;
   if (member.signature.startsWith('()')) return `(${target})`;
   return `(${target} $0)`;
 }

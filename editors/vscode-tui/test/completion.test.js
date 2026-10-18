@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { racketAvailable, fakeVscode, makeDocument, startClient, labelOf } = require('./support');
-const { createCompletionProvider } = require('../lib/completion');
+const { createCompletionProvider, memberItem } = require('../lib/completion');
 const { browse } = require('../lib/browse');
 
 const skip = racketAvailable() ? false : 'racket is not on PATH';
@@ -23,6 +23,17 @@ function positionAfter(doc, text, extra = 0) {
   const offset = SRC.indexOf(text) + text.length + extra;
   return doc.positionAt(offset);
 }
+
+test('fields and enum members get their own item kinds, typed like properties', () => {
+  const vscode = fakeVscode();
+  const range = {};
+  const field = memberItem(vscode, { name: 'MaxValue', kind: 'field', type: 'int32' }, range);
+  assert.equal(field.kind, vscode.CompletionItemKind.Field);
+  assert.deepEqual(field.label, { label: 'MaxValue', description: 'int32' });
+  const monday = memberItem(vscode, { name: 'Monday', kind: 'enum-member', type: 'DayOfWeek' }, range);
+  assert.equal(monday.kind, vscode.CompletionItemKind.EnumMember);
+  assert.deepEqual(monday.label, { label: 'Monday', description: 'DayOfWeek' });
+});
 
 test('a document that is not a Tui module gets no completions', async () => {
   const vscode = fakeVscode();

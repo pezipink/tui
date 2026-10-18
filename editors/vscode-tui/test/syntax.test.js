@@ -32,8 +32,12 @@ test('no member access where the dot is not after a name or a literal', () => {
   assert.equal(memberAccess('plain'), null);
 });
 
-test('browse inserts properties bare and methods as calls', () => {
+test('browse inserts properties, fields and enum members bare, and methods as calls', () => {
   assert.equal(memberInsertText('xs', { name: 'Count', kind: 'property', type: 'int32' }), 'xs.Count');
+  assert.equal(memberInsertText('System.Int32', { name: 'MaxValue', kind: 'field', type: 'int32' }),
+    'System.Int32.MaxValue');
+  assert.equal(memberInsertText('System.DayOfWeek', { name: 'Monday', kind: 'enum-member', type: 'DayOfWeek' }),
+    'System.DayOfWeek.Monday');
   assert.equal(memberInsertText('xs', { name: 'Clear', kind: 'method', signature: '() -> void' }),
     '(xs.Clear)');
   assert.equal(memberInsertText('xs', { name: 'Add', kind: 'method', signature: '(string) -> void' }),

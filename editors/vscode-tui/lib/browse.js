@@ -43,7 +43,7 @@ async function browse(vscode, service, editor) {
   const memberPick = await vscode.window.showQuickPick(
     members.map((m) => ({
       label: m.name,
-      description: m.kind === 'property' ? m.type : m.signature,
+      description: m.kind === 'method' ? m.signature : m.type,
       detail: m.kind,
       member: m,
     })),

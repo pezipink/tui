@@ -45,6 +45,19 @@
   "(module m tui (define (fact [n : int]) : int (if (< n 2) 1 (* n (fact (- n 1)))))
   (let ([x (fact 5)]) (Console.WriteLine (+ x 1))))")
 
+(test-case "hover tooltips type arrays, aref and static field reads"
+  (define leaves
+    (expanded-tooltips
+     "(module m tui
+  (define (first [xs : |int32[]|]) : int (aref xs 0))
+  (define (max-value) : int System.Int32.MaxValue)
+  (let ([a (array int32 1 2)])
+    (set! (aref a 0) 3)
+    (Console.WriteLine (first a))))"))
+  (check-not-false (member '("xs" "int32[]") leaves))
+  (check-not-false (member '("a" "int32[]") leaves))
+  (check-not-false (member '("System.Int32.MaxValue" "int32") leaves)))
+
 (test-case "hover tooltips mark each typed expression with its type"
   ; A compound expression is marked on its parens; an atom on its own text.
   (check-equal? (expanded-tooltips hover-src)
@@ -684,6 +697,19 @@
   (check-equal? (run-example "phase1.rkt")
                 '("18" "19" "True" "False" "True" "False" "4" "Equals" "55")))
 
+(test-case "the XML example reads and builds documents with System.Xml.Linq"
+  (check-equal? (run-example "xml.rkt")
+                '("3" "Dune" "28.75" "Dune" "Neuromancer"
+                  "<shelf>" "  <book id=\"9\">Hyperion</book>" "  <book id=\"10\">Ubik</book>" "</shelf>"
+                  "title" "lang" "element" "attribute")))
+
+(test-case "the JSON example parses, walks and re-serialises JSON text"
+  (check-equal? (run-example "json.rkt")
+                '("Corner \"Books\"" "7.25" "Abc"
+                  "{\"store\":{\"name\":\"Corner \\\"Books\\\"\",\"open\":true,\"books\":[{\"title\":\"Dune\",\"price\":9.5},{\"title\":\"Neuromancer\",\"price\":7.25}],\"owner\":null},\"tags\":[\"sf\",\"Abc\"]}"
+                  "{\"title\":\"Dune\",\"year\":1965,\"rating\":4.5,\"tags\":[\"sf\",\"classic\"],\"loaned\":false}"
+                  "sf")))
+
 (test-case "threading's ~> and ~>> compile to ordinary Tui calls"
   (check-equal? (run-example "threading.rkt") '("14" "5" "11" "TUI" "pipe" "3"))
   (check-regexp-match #rx"unbound function"
@@ -809,4 +835,22 @@
                                  '(define (k [p : P]) : int (begin (set! p.x "s") 1))))
   (check-regexp-match #rx"no overload of new P accepts \\(\\)"
                       (tui-error '(record P [x : int32]) '(define (m) : P (new P)))))
+
+(test-case "arrays: literals, new-array, aref, for-each over arrays, IEnumerable and strings"
+  (check-equal? (run-example "arrays.rkt")
+                '("6" "2" "1" "2" "3" "4" "5" "6" "21" "3" "True" "False"
+                  "10" "20" "30" "a" "b" "7" "8" "6")))
+
+(test-case "enum members and static fields are read by qualified name"
+  (check-equal? (run-example "enums.rkt")
+                '("Monday" "weekday" "weekend" "True" "weekday" "weekend"
+                  "2147483647" "Integer" "3.14159265358979")))
+
+(test-case "array and static field errors are reported at the user's expression"
+  (check-regexp-match #rx"type mismatch: expected string, got int32"
+                      (tui-error '(define a : |int32[]| (array int32 1 2))
+                                 '(for-each [x : string a] (Console.WriteLine x))))
+  (check-regexp-match #rx"string is not an array" (tui-error '(let ([s "abc"]) (aref s 0))))
+  (check-regexp-match #rx"for-each" (tui-error '(for-each [x 5] (Console.WriteLine x))))
+  (check-regexp-match #rx"Funday" (tui-error '(Console.WriteLine System.DayOfWeek.Funday))))
 

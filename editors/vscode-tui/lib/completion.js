@@ -9,14 +9,21 @@ const RANK_TYPE = '1';
 
 // The signature sits in the label, not in the item's detail, so every overload of a method shows its
 // parameter types in the list rather than only the focused one.
+const MEMBER_KINDS = {
+  property: 'Property',
+  field: 'Field',
+  'enum-member': 'EnumMember',
+  method: 'Method',
+};
+
 function memberItem(vscode, member, range) {
-  const isProperty = member.kind === 'property';
-  const label = isProperty
+  const typed = member.kind !== 'method';
+  const label = typed
     ? { label: member.name, description: member.type }
     : { label: member.name, detail: member.signature };
   const item = new vscode.CompletionItem(
     label,
-    isProperty ? vscode.CompletionItemKind.Property : vscode.CompletionItemKind.Method);
+    vscode.CompletionItemKind[MEMBER_KINDS[member.kind] || 'Method']);
   item.range = range;
   item.sortText = RANK + member.name;
   return item;

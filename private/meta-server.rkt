@@ -14,6 +14,8 @@
 (require json racket/list racket/string
          (only-in rangi/src/cli/reader read-file get-public-typedefs)
          (only-in "clr.rkt" tui-configure! type-methods base-type string->tui-type class-of tui-type->string
+                  receiver-class type-static-fields enum-underlying
+                  clr-field-name clr-field-type clr-field-literal?
                   clr-method-name clr-method-static? clr-method-params clr-method-ret))
 (provide handle-request main)
 
@@ -119,7 +121,7 @@
 ; are added for it, since every interface value is an object.
 (define (inherited-methods t)
   (define chain
-    (let loop ([c (class-of t)])
+    (let loop ([c (receiver-class t)])
       (define b (base-type c))
       (if b (cons c (loop b)) (list c))))
   (define with-object
@@ -146,6 +148,14 @@
               [e (in-value (describe m))]
               #:when e)
     e))
+
+; The public static fields of t, as completion entries. An enum's literal fields are its members.
+(define (field-entries t)
+  (define enum? (and (enum-underlying t) #t))
+  (for/list ([f (in-list (type-static-fields t))])
+    (hasheq 'name (clr-field-name f)
+            'kind (if (and enum? (clr-field-literal? f)) "enum-member" "field")
+            'type (type-text (clr-field-type f)))))
 
 (define (handle-request req)
   (define id (hash-ref req 'id 'null))
@@ -184,8 +194,10 @@
        (define t
          (with-handlers ([exn:fail? (λ (_) #f)])
            (string->tui-type (cond [value (rec-type value)] [literal literal] [else receiver]))))
+       (define static-receiver? (not (or value literal)))
        (ok 'members
-           (member-entries (if t (inherited-methods t) '()) (not (or value literal))))]
+           (append (member-entries (if t (inherited-methods t) '()) static-receiver?)
+                   (if (and t static-receiver?) (field-entries t) '())))]
       [else (fail (format "unknown op ~a" op))])))
 
 (define (main)

@@ -18,6 +18,8 @@
          generic-instance string->tui-type split-type-args class-of tui-type->il
          tui-type->string value-type? primitive-value-type? numeric-type? coercion
          (struct-out clr-method) find-static-methods find-instance-methods find-constructors
+         (struct-out clr-field) type-static-fields find-static-field literal-instructions
+         enum-underlying enumerable-element szarray-type? szarray-elem receiver-class
          resolve-overload owner->il base-type supertypes type-methods
          declare-record! reset-local-declarations!
          lambda-placeholder lambda-placeholder? null-placeholder null-placeholder? reference-type?
@@ -90,7 +92,7 @@
                    (method-desc r ".ctor" #t #f #f #f #f 0 types 'void))
   (for ([f (in-list fields)] [t (in-list types)])
     (define n (car f))
-    (declare-member! local-provider r (field-desc r n #f #f t))
+    (declare-member! local-provider r (field-desc r n #f #f t #f #f))
     (declare-member! local-provider r (method-desc r (string-append "get_" n) #t #f #f #f #f 0 '() t))
     (declare-member! local-provider r
                      (method-desc r (string-append "set_" n) #t #f #f #f #f 0 (list t) 'void)))
@@ -334,14 +336,34 @@
   (and (pair? to)
        (or (pair? from) (eq? from 'string))
        (not (value-type? from))
-       (let ([c (receiver-class from)])
-         (or (equal? c to) (and (member to (supertypes c)) #t)))
-       #t))
+       (and (member to (reference-supertypes from)) #t)))
 
 ; The class whose members a value of type t has: an array's are System.Array's, and a string's or
 ; object's are those of System.String or System.Object (see class-of).
 (define (receiver-class t)
   (if (szarray-type? t) (list 'class core-asm "System" "Array" '()) (class-of t)))
+
+; The types a value of type t converts to implicitly: its receiver class and that class's
+; supertypes, plus IEnumerable<elem> for an array.
+(define (reference-supertypes t)
+  (define c (receiver-class t))
+  (define e (and (szarray-type? t)
+                 (generic-instance "System.Collections.Generic.IEnumerable" (list (szarray-elem t)))))
+  (append (cons c (supertypes c)) (if e (list e) '())))
+
+; The element type T of the IEnumerable<T> that t is or implements, or #f. An array's element is
+; its own element type.
+(define (enumerable-element t)
+  (cond
+    [(szarray-type? t) (szarray-elem t)]
+    [else
+     (define c (class-of t))
+     (for/first ([s (in-list (cons c (supertypes c)))]
+                 #:when (and (pair? s) (eq? (car s) 'class)
+                             (equal? (list-ref s 2) "System.Collections.Generic")
+                             (equal? (list-ref s 3) "IEnumerable")
+                             (= 1 (length (list-ref s 4)))))
+       (car (list-ref s 4)))]))
 
 ; Every base class and interface of a class type, transitively, as Tui types.
 (define (supertypes t)
@@ -454,14 +476,16 @@
 
 (define (find-static-methods type-name method-name)
   (define t (resolve-clr-type-name type-name))
-  (define owner
-    (cond
-      [(assq t primitive-classes) => (λ (p) (list 'class core-asm "System" (cdr p) '()))]
-      [t (class-of t)]
-      [else #f]))
+  (define owner (and t (static-owner t)))
   (and owner
        (filter (λ (m) (and (clr-method-static? m) (equal? (clr-method-name m) method-name)))
                (type-methods owner))))
+
+; The class whose static members a type names: a primitive's System class, otherwise the type.
+(define (static-owner t)
+  (cond
+    [(assq t primitive-classes) => (λ (p) (list 'class core-asm "System" (cdr p) '()))]
+    [else (class-of t)]))
 
 ; Instance methods named method-name on t and its base types, most derived first, as a list of
 ; groups (one group per type in the chain).
@@ -540,16 +564,14 @@
 ; The generic definition a class type instantiates: its assembly, namespace and name.
 (define (generic-key t) (list (cadr t) (caddr t) (cadddr t)))
 
-; The supertype of a (a class type or string, or a primitive, which has none) that has the generic
-; definition of p, or #f.
+; The supertype of a (a class type, string, array, or primitive, which has none) that has the
+; generic definition of p, or #f.
 (define (matching-supertype a p)
-  (define ca (class-of a))
-  (and (pair? ca) (eq? (car ca) 'class)
-       (for/first ([s (in-list (cons ca (supertypes ca)))]
-                   #:when (and (pair? s)
-                               (equal? (generic-key s) (generic-key p))
-                               (= (length (class-args s)) (length (class-args p)))))
-         s)))
+  (for/first ([s (in-list (reference-supertypes a))]
+              #:when (and (pair? s) (eq? (car s) 'class)
+                          (equal? (generic-key s) (generic-key p))
+                          (= (length (class-args s)) (length (class-args p)))))
+    s))
 
 ; Matches a parameter type p against an argument type a, binding the method type parameters in
 ; slots. A generic instance parameter matches the argument's supertype of the same definition, so
@@ -661,6 +683,53 @@
                    (string-join (map tui-type->string arg-types) " ")))
           (values (cadr (car winners)) (caddr (car winners)))])])))
 
+;; ---------------------------------------------------------------------------------------------
+;; Static fields
+
+; A public static field of a class type. A literal (an enum member, or a constant) carries its
+; value, which main.rkt emits in place of a load (see literal-instructions).
+(struct clr-field (owner name type literal? value) #:transparent)
+
+; The public static fields of a class type, as clr-fields. A field whose type Tui does not model
+; is left out, and so is a literal whose value Tui cannot emit.
+(define (type-static-fields t)
+  (define owner (static-owner t))
+  (define d (class-desc owner))
+  (cond
+    [(not d) '()]
+    [else
+     (for*/list ([f (in-list (force (type-desc-fields d)))]
+                 #:when (and (field-desc-public? f) (field-desc-static? f))
+                 [ft (in-value (sig->tui (field-desc-type f)))]
+                 #:when (and ft (or (not (field-desc-literal? f))
+                                    (literal-instructions ft (field-desc-value f)))))
+       (clr-field owner (field-desc-name f) ft (field-desc-literal? f) (field-desc-value f)))]))
+
+; An enum's underlying integral type, from its value__ field, or #f.
+(define (enum-underlying t)
+  (define d (class-desc t))
+  (and d (eq? (type-desc-shape d) 'enum)
+       (for/first ([f (in-list (force (type-desc-fields d)))]
+                   #:when (and (not (field-desc-static? f)) (equal? (field-desc-name f) "value__")))
+         (sig->tui (field-desc-type f)))))
+
+; The instructions that push a literal's value v of Tui type t, or #f when Tui cannot emit it. An
+; enum is emitted as its underlying type. A null reference is #f, and is pushed with ldnull.
+(define (literal-instructions t v)
+  (define base (or (enum-underlying t) t))
+  (cond
+    [(and (not v) (not (value-type? base))) '((ldnull))]
+    [(memq base '(bool char int32)) (list `(ldc.i4 ,(cond [(boolean? v) (if v 1 0)] [else v])))]
+    [(eq? base 'int64) (list `(ldc.i8 ,v))]
+    [(eq? base 'float64) (list `(ldc.r8 ,(exact->inexact v)))]
+    [(and (eq? base 'string) (string? v)) (list `(ldstr ,v))]
+    [else #f]))
+
+; The public static field named field-name of the type named type-name, or #f.
+(define (find-static-field type-name field-name)
+  (define t (resolve-clr-type-name type-name))
+  (and t (findf (λ (f) (equal? (clr-field-name f) field-name)) (type-static-fields t))))
+
 ; A type named in source text, as the type arguments of a call name it: a primitive alias, a
 ; dotted class name, or a generic instance such as "System.Collections.Generic.List<int32>".
 ; Returns the Tui type or #f.
@@ -668,6 +737,8 @@
   (define t (string-trim s))
   (cond
     [(assq (string->symbol t) primitive-aliases) => cdr]
+    [(regexp-match #rx"^(.+)\\[\\]$" t)
+     => (λ (m) (let ([e (string->tui-type (cadr m))]) (and e (list 'szarray e))))]
     [(regexp-match #rx"^([^<]+)<(.*)>$" t)
      => (λ (m)
           (define args (map string->tui-type (split-type-args (caddr m))))

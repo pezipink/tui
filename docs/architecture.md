@@ -181,7 +181,8 @@ A Tui type is a datum:
 - A primitive symbol: `void`, `bool`, `char`, `int32`, `int64`, `float64`, `string`, `object`.
 - `(class asm ns name args)` for a CLR class, with `args` the closed type arguments.
 - `(szarray t)` for a single-dimension array, and `(mvar n)` for the nth type parameter of a
-  generic method, which exists only before instantiation.
+  generic method, which exists only before instantiation. An array is written `|int32[]|` in source
+  and `|int32[][]|` for a jagged array. `string->tui-type` and `ann->type` read both forms.
 
 The functions that move between syntax and datums:
 
@@ -264,6 +265,31 @@ Hover: `a.Name` is marked as one expression, and its receiver `a` has its own le
 a compound expression, so it is marked on its first and last characters only, as for any form in the
 hover model. The middle of a threaded step's name has no tooltip.
 
+### Static fields and enum members
+
+`Type.Name` with no arguments reads a public static field when the type has one of that name, and
+only then falls back to a property or method. A literal field (a `const`) is emitted as its value
+with `ldc`, `ldstr` or `ldnull`. An enum member is a literal field typed as the enum, so it is emitted
+as the enum's underlying integer. Other static fields are read with `ldsfld`. Tui cannot define an
+enum; it only passes enum values around, compares them with `=`, and reads their members by name.
+Constants of a type Tui cannot emit, such as `Byte`, are not read. They are missing from completion
+and give an unknown member error.
+
+### Arrays and loops
+
+- `(array T e ...)` builds an array of T from its elements. `(new-array T n)` builds one of length n
+  with default elements. `(aref a i)` reads an element, and `(set! (aref a i) v)` writes one. Index
+  and length are `int32`. `a.Length` reads the length, since an array's members are System.Array's.
+- `(for-each [x xs] body ...)` loops over an array, an `IEnumerable<T>` (such as a `List<T>`), or a
+  string. The element type comes from the array, the enumerable's element type, or `char` for a
+  string. The loop variable can be annotated, as in `[x : int32 xs]`, and the annotation must match
+  the element type. The loop lowers to `GetEnumerator`, `MoveNext` and `Current` on an enumerator,
+  or to indexed access for an array. `MoveNext` is called on the non-generic
+  `System.Collections.IEnumerator`, since `IEnumerator<T>` has no base class and a lookup through its
+  bases does not find the method.
+- An array converts to `IEnumerable<T>` for its element type, so `Enumerable.Contains` and other
+  LINQ methods take it. Section 7 gives the cost.
+
 ### Fixing type arguments (`infer-targs`)
 
 Each parameter is matched against its argument, in order:
@@ -332,6 +358,7 @@ and returns:
 | primitive value type to `object` | 2 | `box` |
 | struct or enum to `object` | 2 | `box` |
 | struct or enum to an interface or base class it implements | 1 | `box` |
+| array to `IEnumerable<T>` for its element type | 1 | none |
 
 Reference upcasts emit no IL, because the verifier accepts a reference to a base type. The cost of
 `object` is higher than any base class or interface, so `List<T>` prefers `IEnumerable<T>` over
@@ -634,7 +661,8 @@ Limits:
 - `(open Gen)` checks the name and that the type has type arguments. It does not check the arity.
 - `(or ...)` takes the first branch that matches. Its branches are not checked to bind the same
   `?id`s.
-- `szarray` patterns compile, but no example exercises them. Tui has no array-construction syntax yet.
+- `szarray` patterns compile, and arrays are now built by `array` and `new-array`, but no type-pattern
+  example uses `szarray`.
 - A named pattern exported from one module and used from another has not been tested.
 
 ## 13. REPL
@@ -733,10 +761,14 @@ and run `raco make main.rkt`.
 | `linq.rkt` | LINQ over stored lambdas, reference conversions | `LINQ works with stored lambdas, library macros and reference conversions` |
 | `fnlib.rkt` | `compose` and `square` library macros | `compose checks that both arguments are Func<int32, int32>` |
 | `phase1.rkt` | metadata helpers at expansion time | `phase 1 macros read overloads, supertypes and members from metadata` |
+| `xml.rkt` | `System.Xml.Linq`: reading and building documents, a macro that walks an element path, an XML literal built at expansion time, a syntax class that names elements, and `type-match` on node kinds | `the XML example reads and builds documents with System.Xml.Linq` |
+| `json.rkt` | a JSON parser and printer in one file: an index-linked node table, recursive descent with `while`, `json-literal` and `json-get` macros that build and walk JSON at expansion time, and `json-show` using `type-match` on `x.Type` | `the JSON example parses, walks and re-serialises JSON text` |
 | `syntax-classes.rkt` | syntax classes, `define-simple-macro`, phase-1 helpers | `phase 1 definitions: syntax classes, simple macros and phase-1 helpers` |
 | `threading.rkt` | `threading`'s `~>` and `~>>` | `threading's ~> and ~>> compile to ordinary Tui calls, and a bare .Name clause reads a member` |
 | `values.rkt` | module values, `set!`, initialization order | `module values are static fields set in source order, and set! updates them` |
 | `records.rkt` | record declarations: constructor, `get_`/`set_` properties, `set!` on a field, a record field of a record type, type-syntax-classes that name `Point` or match it structurally, and `type-match` on a record | `a record has a constructor, get_ and set_ properties, and can be passed and returned` |
+| `arrays.rkt` | array literals, `new-array`, `aref` read and write, `for-each` over arrays, jagged arrays, `IEnumerable<T>`, strings and closures, `Length`, `Enumerable.Contains` | `arrays: literals, new-array, aref, for-each over arrays, IEnumerable and strings` |
+| `enums.rkt` | enum parameters and members, `=` on enums, a module value of an enum type, `Int32.MaxValue`, a literal field, `Math.PI` | `enum members and static fields are read by qualified name` |
 
 ## 17. Known limits
 
@@ -765,14 +797,13 @@ and run `raco make main.rkt`.
 - Type patterns (section 12.1) see only the members Tui models. `(open Gen)` checks the name and
   that there are type arguments, not the arity. `(or ...)` does not check that its branches bind the
   same `?id`s. `szarray` patterns compile but no example exercises them.
-- Member lookup shows only the public members whose signatures use types Tui models. Arrays and
-  structs are modeled: a `(szarray T)` or struct or enum parameter is visible, and an array can be a
-  method's return value. Tui cannot construct arrays, and it cannot name an enum constant, because a
-  static field read by qualified name, such as `System.Globalization.NumberStyles.Integer`, is an
-  unbound identifier. Enum overloads are therefore visible but cannot be given an enum argument from
-  source.
-- Arrays are not `IEnumerable<T>`, so `Enumerable` methods do not accept them, and an array is not
-  converted to an array of a base type.
+- Member lookup shows only the public members whose signatures use types Tui models. Arrays, structs
+  and enums are modeled. Tui cannot define an enum, and it cannot write a static field that is not a
+  constant. Multi-dimensional arrays, pointers and byrefs are not supported.
+- Constant fields of types Tui cannot emit, such as `Byte`, are not read, so they are missing from
+  completion and an unknown member error reports them.
+- Array covariance is not modeled. An array of a derived type does not convert to an array of its base
+  type.
 - A named pattern exported from one module and used from another has not been tested.
 - Captured cells use one array per variable. Grouping captures into one object would reduce
   allocations; see [captures.md](captures.md) section 9.
