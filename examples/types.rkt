@@ -31,3 +31,8 @@
 (Console.WriteLine (.get_Length (default-of System.String)))
 (Console.WriteLine (.get_Length (default-of System.Text.StringBuilder)))
 (Console.WriteLine (type-name-of (list-of 1 2)))
+
+; null is a value of a reference type: a bare null takes the type of the parameter it is passed to.
+(define (missing [s : string]) : bool (null? s))
+(Console.WriteLine (missing null))
+(Console.WriteLine (missing "x"))

@@ -18,7 +18,8 @@
                      [tui-while while] [tui-begin begin] [tui-and and] [tui-or or] [tui-not not]
                      [tui-new new] [tui-list-of list-of] [tui-fn fn]
                      [tui-+ +] [tui-- -] [tui-* *] [tui-/ /] [tui-% %]
-                     [tui-< <] [tui-> >] [tui-<= <=] [tui->= >=] [tui-= =])
+                     [tui-< <] [tui-> >] [tui-<= <=] [tui->= >=] [tui-= =]
+                     [tui-null null] [tui-null-of null-of] [tui-null? null?])
          ; syntax-rules compiles its patterns at phase 1, so the ellipsis is needed there too
          using open define-syntax-rule define-syntax define-syntax-parser require provide
          define-simple-macro define-syntax-class define-splicing-syntax-class pattern
@@ -126,20 +127,57 @@
   (define (il ty instrs)
     (syntax-property #`(tui-il #,(datum->syntax #f (list ty instrs))) 'tui-type ty))
 
-  ; Expands stx to a typed fragment: (values type instructions).
-  (define (tc stx [ctx #f])
+  ; Hover tooltips. Each user expression's type is recorded under its source file, keyed by its
+  ; span, so that a required module does not disturb the module being expanded. The module's end
+  ; (tui-tooltips) turns the table into 'mouse-over-tooltips for Check Syntax and racket-langserver.
+  (define-logger online-check-syntax)
+  (define tooltip-tables (make-hash))
+  (define tooltip-log-message "Tui tooltip syntaxes; this message is ignored")
+
+  ; racket-langserver shows this text as Markdown, where a bare <int32> is an HTML tag and is
+  ; hidden, so the angle brackets of generic types are escaped.
+  (define (tooltip-markdown s)
+    (regexp-replace* #rx"[<>]" s (λ (m) (string-append "\\" m))))
+
+  (define (record-tooltip! stx ty)
+    (define src (syntax-source stx))
+    (when (and src (syntax-position stx) (> (syntax-span stx) 0))
+      (define tbl (hash-ref! tooltip-tables src make-hash))
+      (define key (cons (syntax-position stx) (syntax-span stx)))
+      (unless (hash-ref tbl key #f)
+        (hash-set! tbl key (cons stx (tooltip-markdown (tui-type->string ty)))))))
+
+  ; Tooltip leaves for one expression, as Typed Racket places them: a compound expression is
+  ; marked on its parens only, so overlapping expressions do not clash. Positions are 0-based.
+  (define (tooltip-leaves stx text)
+    (define start (sub1 (syntax-position stx)))
+    (define span (syntax-span stx))
+    (if (pair? (syntax-e stx))
+        (list (vector stx start (add1 start) text)
+              (vector stx (+ start span -1) (+ start span) text))
+        (list (vector stx start (+ start span) text))))
+
+  (define (tooltip-vectors tbl)
+    (for*/list ([entry (in-list (sort (hash-values tbl) < #:key (λ (e) (syntax-position (car e)))))]
+                [leaf (in-list (tooltip-leaves (car entry) (cdr entry)))])
+      leaf))
+
+  ; Expands stx to a typed fragment: (values type instructions). origin is the source syntax
+  ; that the type is recorded for, when stx is already expanded and has lost its location.
+  (define (tc stx [ctx #f] [origin stx])
     (define e (local-expand stx 'expression (list #'tui-il) ctx))
     (syntax-case e ()
       [(head payload)
        (and (identifier? #'head) (free-identifier=? #'head #'tui-il))
-       (let ([p (syntax->datum #'payload)])
-         (values (or (syntax-property e 'tui-type) (error 'tui "internal: untyped fragment"))
-                 (cadr p)))]
+       (let* ([p (syntax->datum #'payload)]
+              [ty (or (syntax-property e 'tui-type) (error 'tui "internal: untyped fragment"))])
+         (record-tooltip! origin ty)
+         (values ty (cadr p)))]
       [_ (raise-syntax-error 'tui "not a Tui expression" stx)]))
 
   ; Expands stx and converts it to type `to`, or raises a type error at stx.
-  (define (tc/expect stx to)
-    (define-values (ty code) (tc (syntax-property stx 'tui-expected to)))
+  (define (tc/expect stx to [origin stx])
+    (define-values (ty code) (tc (syntax-property stx 'tui-expected to) #f origin))
     (define c (coercion ty to))
     (unless c
       (raise-syntax-error 'tui (format "type mismatch: expected ~a, got ~a"
@@ -249,7 +287,7 @@
   ; fn (one without a delegate name) is typed as a placeholder of its arity and compiled against
   ; the chosen overload's parameter type by finish-call. Each argument gives its type and its code,
   ; or a deferred-fn.
-  (struct deferred-fn (stx))
+  (struct deferred-fn (stx origin))
 
   ; The arity of a bare fn form (fn (p ...) body ...+) as expanded, or #f for any other form.
   (define (bare-fn-arity e)
@@ -261,13 +299,20 @@
          (let ([ps (syntax->list (cadr xs))])
            (and ps (length ps)))))
 
+  ; A bare null is the identifier null, which has no type until an expected type is known.
+  (define (bare-null? s)
+    (and (identifier? s) (free-identifier=? s #'tui-null 0 0)))
+
   (define (tc-args stxs)
     (for/lists (tys codes) ([s (in-list stxs)])
-      (define e (local-expand s 'expression (list #'tui-il #'tui-fn) #f))
-      (define n (bare-fn-arity e))
-      (if n
-          (values (lambda-placeholder n) (deferred-fn e))
-          (tc e))))
+      (cond
+        [(bare-null? s) (values null-placeholder (deferred-fn s s))]
+        [else
+         (define e (local-expand s 'expression (list #'tui-il #'tui-fn) #f))
+         (define n (bare-fn-arity e))
+         (if n
+             (values (lambda-placeholder n) (deferred-fn e s))
+             (tc e))])))
 
   ; The code of each argument for the closed method's parameter types params, with the conversions
   ; from resolve-overload. A deferred fn is compiled against its parameter type, and needs no
@@ -276,7 +321,7 @@
     (append*
      (for/list ([c (in-list codes)] [conv (in-list convs)] [p (in-list params)])
        (if (deferred-fn? c)
-           (tc/expect (deferred-fn-stx c) p)
+           (tc/expect (deferred-fn-stx c) p (deferred-fn-origin c))
            (append c conv)))))
 
   ; Compiles a bare fn whose parameter type p may still have open type arguments, held in the
@@ -320,10 +365,14 @@
        (define slots (list->vector targs))
        (define compiled
          (for/list ([c (in-list codes)] [t (in-list tys)] [p (in-list (clr-method-params m))])
-           (if (deferred-fn? c)
-               (let-values ([(fty fcode) (compile-partial-fn (deferred-fn-stx c) p slots)])
-                 (list fty fcode))
-               (list t c))))
+           (cond
+             ; a null fixes no type argument, so it is compiled once the method is closed
+             [(and (deferred-fn? c) (bare-null? (deferred-fn-stx c))) (list #f c)]
+             [(deferred-fn? c)
+              (let-values ([(fty fcode) (compile-partial-fn (deferred-fn-stx c) p slots)])
+                (record-tooltip! (deferred-fn-origin c) fty)
+                (list fty fcode))]
+             [else (list t c)])))
        (define open
          (for/list ([s (in-vector slots)] [i (in-naturals)] #:unless s) i))
        (unless (null? open)
@@ -335,12 +384,17 @@
         m*
         (append*
          (for/list ([cl (in-list compiled)] [p (in-list (clr-method-params m*))])
-           (define c (coercion (car cl) p))
-           (unless c
-             (raise-syntax-error 'tui (format "argument has type ~a, expected ~a"
-                                              (tui-type->string (car cl)) (tui-type->string p))
-                                 stx))
-           (append (cadr cl) (cdr c)))))]))
+           (cond
+             [(not (car cl))
+              (define nul (cadr cl))
+              (tc/expect (deferred-fn-stx nul) p (deferred-fn-origin nul))]
+             [else
+              (define c (coercion (car cl) p))
+              (unless c
+                (raise-syntax-error 'tui (format "argument has type ~a, expected ~a"
+                                                 (tui-type->string (car cl)) (tui-type->string p))
+                                    stx))
+              (append (cadr cl) (cdr c))]))))]))
 
   ;; Tui functions: (define (f [x : T] ...) : R body ...+). The binding of f holds its declared
   ;; signature as syntax; types are resolved when used, after the module's references are set.
@@ -418,6 +472,7 @@
           (define index (caddr b))
           (define ty (cadddr b))
           (define ord (next-ordinal!))
+          (record-tooltip! id ty)
           (cond
             [(and (eq? kind 'arg) (cell-ordinal? ord))
              (define j (alloc-local-in! m (cell-of ty)))
@@ -794,6 +849,7 @@
      (define opens (cons "System" (map open-namespace (of 'open))))
      (tui-configure! refs opens)
      (set-box! lifted-classes '())
+     (hash-remove! tooltip-tables (syntax-source stx))
      (define defs (of 'define))
      (define vals (of 'value))
      (define val-names (for/list ([v vals]) (list-ref (syntax->list v) 1)))
@@ -827,11 +883,26 @@
              (make-tui-program (tui-reference-list)
                                (append (list (cons 'name (tui-method def)) ...) vdecl ...)
                                (tui-main (vinit ...) stmt ...))))
+          ; after prog, so every method and expression of the module has been recorded
+          (define %tui-tooltips (tui-tooltips #,(datum->syntax #f (syntax-source stx))))
           (provide (rename-out [prog tui-program]))
           (module+ main (run-tui-program prog))))]))
 
 (define-syntax (tui-reference-list stx)
   #`(quote #,(tui-references)))
+
+; Logs the module's tooltips on online-check-syntax for racket-langserver, and keeps them in the
+; expansion for Check Syntax. The carrier's 'mouse-over-tooltips property holds the leaves.
+(define-syntax (tui-tooltips stx)
+  (syntax-case stx ()
+    [(_ src)
+     (let* ([tbl (hash-ref tooltip-tables (syntax-e #'src) make-hash)]
+            [carrier (syntax-property (datum->syntax #f 'tui-tooltips)
+                                      'mouse-over-tooltips (tooltip-vectors tbl))])
+       (log-message online-check-syntax-logger 'info 'online-check-syntax
+                    tooltip-log-message (list carrier))
+       (with-syntax ([c carrier])
+         #'(quote c)))]))
 
 ; The field and the initializer of a module value, as (name . datum) pairs. earlier are the names
 ; of the values defined before it.
@@ -922,6 +993,37 @@
 (define-tui-form (tui-top stx)
   (syntax-parse stx
     [(_ . id) (raise-syntax-error 'tui "unbound identifier" #'id)]))
+
+; A bare null takes its type from the expected type (set by tc/expect), which must be a reference
+; type. Its code is the same whatever the type is.
+(define-tui-form (tui-null stx)
+  (define expected (syntax-property stx 'tui-expected))
+  (cond
+    [(not expected) (raise-syntax-error 'tui "null needs an expected reference type" stx)]
+    [(not (reference-type? expected))
+     (raise-syntax-error 'tui (format "null cannot have type ~a" (tui-type->string expected)) stx)]
+    [else (il expected '((ldnull)))]))
+
+; (null-of T) is a null of the reference type T, for places with no expected type, such as a let.
+(define-tui-form (tui-null-of stx)
+  (syntax-parse stx
+    [(_ t:typeName)
+     (unless (reference-type? (attribute t.Type))
+       (raise-syntax-error 'tui (format "null-of needs a reference type, got ~a"
+                                        (tui-type->string (attribute t.Type)))
+                           #'t))
+     (il (attribute t.Type) '((ldnull)))]))
+
+; (null? e) is true when the reference e is null.
+(define-tui-form (tui-null? stx)
+  (syntax-parse stx
+    [(_ a)
+     (when (bare-null? #'a) (raise-syntax-error 'tui "null? needs a value, not a bare null" #'a))
+     (define-values (ty code) (tc #'a))
+     (unless (reference-type? ty)
+       (raise-syntax-error 'tui (format "null? needs a reference type, got ~a" (tui-type->string ty))
+                           #'a))
+     (il 'bool (append code '((ldnull) (ceq))))]))
 
 ; (Type.Method arg ...) calls a static .NET method; (.Method obj arg ...) calls an instance one.
 (define-tui-form (tui-app stx)
@@ -1052,6 +1154,7 @@
      (for ([ty tys] [e (syntax->list #'(e ...))])
        (when (eq? ty 'void) (raise-syntax-error 'tui "cannot bind a void value" e)))
      (define xs (syntax->list #'(x ...)))
+     (for ([x (in-list xs)] [t (in-list tys)]) (record-tooltip! x t))
      (define ords (for/list ([x (in-list xs)]) (next-ordinal!)))
      (define cells? (for/list ([ord (in-list ords)]) (cell-ordinal? ord)))
      (define slots (for/list ([ty tys] [c? cells?]) (alloc-local! stx (if c? (cell-of ty) ty))))
@@ -1083,10 +1186,12 @@
        [(tui-global? v)
         (check-global-scope v #'x)
         (define ty (global-type v))
+        (record-tooltip! #'x ty)
         (il 'void (append (tc/expect #'e ty)
                           `((stsfld Program ,(tui-global-name v) ,(tui-type->il ty)))))]
        [else
         (unless (tui-var? v) (raise-syntax-error 'tui "not a variable" #'x))
+        (record-tooltip! #'x (tui-var-type v))
         (il 'void (store-var v #'x (tc/expect #'e (tui-var-type v))))])]))
 
 ; (fn Delegate (param ...) body ...+), or (fn (param ...) body ...+) when the expected type of the
@@ -1220,8 +1325,22 @@
 (define-tui-form (tui->= stx) (syntax-parse stx [(_ a b) (compare stx '((clt) (ldc.i4.0) (ceq)) #'a #'b)]))
 
 ; Numbers compare by value, strings with String.op_Equality, bool, char and references with ceq.
+; A null operand takes the type of the other operand, which must be a reference type.
 (define-tui-form (tui-= stx)
   (syntax-parse stx
+    [(_ a b)
+     #:when (or (bare-null? #'a) (bare-null? #'b))
+     (when (and (bare-null? #'a) (bare-null? #'b))
+       (raise-syntax-error 'tui "cannot compare null with null" stx))
+     (define null-first? (bare-null? #'a))
+     (define-values (other-ty other-code) (tc (if null-first? #'b #'a)))
+     (unless (reference-type? other-ty)
+       (raise-syntax-error 'tui (format "cannot compare ~a with null" (tui-type->string other-ty))
+                           stx))
+     (define null-code (tc/expect (if null-first? #'a #'b) other-ty))
+     (il 'bool (append (if null-first? null-code other-code)
+                       (if null-first? other-code null-code)
+                       '((ceq))))]
     [(_ a b)
      (define-values (tys codes) (tc* (list #'a #'b)))
      (cond

@@ -15,7 +15,8 @@
          tui-type->string value-type? numeric-type? coercion
          (struct-out clr-method) find-static-methods find-instance-methods find-constructors
          resolve-overload owner->il base-type supertypes type-methods
-         lambda-placeholder lambda-placeholder? delegate-type?
+         lambda-placeholder lambda-placeholder? null-placeholder null-placeholder? reference-type?
+         delegate-type?
          class-args has-mvar? erase-mvars delegate-param-args bind-type subst-mvars instantiate-method)
 
 (define reference-assemblies-dir
@@ -195,6 +196,15 @@
 (define (lambda-placeholder n) (list 'lambda n))
 (define (lambda-placeholder? t) (and (pair? t) (eq? (car t) 'lambda)))
 
+; The type of a bare null argument during overload resolution: it matches any reference parameter,
+; and its code is compiled once the overload is chosen.
+(define null-placeholder 'null-arg)
+(define (null-placeholder? t) (eq? t null-placeholder))
+
+; A type that a null can have: anything but a value type, void, or an unfixed type parameter.
+(define (reference-type? t)
+  (not (or (value-type? t) (eq? t 'void) (and (pair? t) (eq? (car t) 'mvar)))))
+
 (define (tui-type->string t)
   (cond
     [(and (pair? t) (eq? (car t) 'class))
@@ -202,6 +212,7 @@
      (string-append (full-name (caddr t) (cadddr t))
                     (if (null? args) "" (format "<~a>" (string-join (map tui-type->string args) ", "))))]
     [(lambda-placeholder? t) (format "fn/~a" (cadr t))]
+    [(null-placeholder? t) "null"]
     [else (symbol->string t)]))
 
 (define (full-name ns name) (if (equal? ns "") name (string-append ns "." name)))
@@ -385,7 +396,10 @@
 ; The coercion of an argument of type from to parameter type to, as coercion, or as a placeholder
 ; match when from is a bare fn.
 (define (arg-coercion from to)
-  (if (lambda-placeholder? from) (placeholder-coercion from to) (coercion from to)))
+  (cond
+    [(lambda-placeholder? from) (placeholder-coercion from to)]
+    [(null-placeholder? from) (and (reference-type? to) (cons 0 '()))]
+    [else (coercion from to)]))
 
 (define (find-constructors t)
   (filter (λ (m) (and (not (clr-method-static? m)) (equal? (clr-method-name m) ".ctor")))
@@ -443,7 +457,7 @@
 ; argument that differs from it is left to the coercion check.
 (define (bind-type p a slots fixed)
   (cond
-    [(lambda-placeholder? a) #t]
+    [(or (lambda-placeholder? a) (null-placeholder? a)) #t]
     [(and (pair? p) (eq? (car p) 'mvar))
      (define i (cadr p))
      (cond [(vector-ref fixed i) #t]

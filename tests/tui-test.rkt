@@ -26,6 +26,76 @@
       (expand `(module m tui ,@forms))
       #f)))
 
+; Expands a module read from src, and returns the (text type) of each 'mouse-over-tooltips leaf in
+; the expansion, where text is the source text the leaf covers.
+(define (expanded-tooltips src)
+  (parameterize ([current-namespace (make-base-namespace)])
+    (let find ([s (expand (read-syntax 'm (open-input-string src)))])
+      (cond
+        [(syntax? s)
+         (define leaves (syntax-property s 'mouse-over-tooltips))
+         (append (for/list ([leaf (in-list (or leaves '()))])
+                   (list (substring src (vector-ref leaf 1) (vector-ref leaf 2))
+                         (vector-ref leaf 3)))
+                 (find (syntax-e s)))]
+        [(pair? s) (append (find (car s)) (find (cdr s)))]
+        [else '()]))))
+
+(define hover-src
+  "(module m tui (define (fact [n : int]) : int (if (< n 2) 1 (* n (fact (- n 1)))))
+  (let ([x (fact 5)]) (Console.WriteLine (+ x 1))))")
+
+(test-case "hover tooltips mark each typed expression with its type"
+  ; A compound expression is marked on its parens; an atom on its own text.
+  (check-equal? (expanded-tooltips hover-src)
+                '(("n" "int32")
+                  ("(" "int32") (")" "int32")
+                  ("(" "bool") (")" "bool")
+                  ("n" "int32") ("2" "int32") ("1" "int32")
+                  ("(" "int32") (")" "int32")
+                  ("n" "int32")
+                  ("(" "int32") (")" "int32")
+                  ("(" "int32") (")" "int32")
+                  ("n" "int32") ("1" "int32")
+                  ("(" "void") (")" "void")
+                  ("x" "int32")
+                  ("(" "int32") (")" "int32") ("5" "int32")
+                  ("(" "void") (")" "void")
+                  ("x" "int32") ("1" "int32"))))
+
+(test-case "hover tooltips cover let and set! binders, fn parameters and call arguments"
+  (define leaves
+    (expanded-tooltips
+     "(module m tui
+  (using \"System.Core\") (open System.Linq)
+  (define counter : int 0)
+  (let ([n 0])
+    (set! n 5)
+    (set! counter 7)
+    (Console.WriteLine (.get_Item1 (System.Tuple.Create 1 \"a\"))))
+  (let ([p (System.Tuple.Create 1 \"a\")])
+    (Console.WriteLine (.get_Item1 p))
+    (let ([sq (fn ([x : int]) (* x x))])
+      (Console.WriteLine (.Invoke sq 3))))
+  (let ([t (System.Tuple.Create 1 \"a\")]) (Console.WriteLine t)))"))
+  (for ([leaf (in-list '(("n" "int32")
+                         ("counter" "int32")
+                         ("p" "System.Tuple\\<int32, string\\>")
+                         ("sq" "System.Func\\<int32, int32\\>")
+                         ("x" "int32")
+                         ("t" "System.Tuple\\<int32, string\\>")))])
+    (check-not-false (member leaf leaves) (format "missing leaf ~s" leaf))))
+
+(test-case "hover tooltips are logged on online-check-syntax for racket-langserver"
+  (define rcv (make-log-receiver (current-logger) 'info 'online-check-syntax))
+  (expanded-tooltips hover-src)
+  (define v (sync/timeout 5 rcv))
+  (check-true (vector? v))
+  (check-equal? (vector-ref v 3) 'online-check-syntax)
+  (define carriers (vector-ref v 2))
+  (check-equal? (length carriers) 1)
+  (check-equal? (length (syntax-property (car carriers) 'mouse-over-tooltips)) 27))
+
 (test-case "examples run"
   (check-equal? (run-example "basics.rkt")
                 '("3628800" "832040" "KIA ORA!" "1.4142135623731" "5"))
@@ -124,7 +194,7 @@
 
 (test-case "default-of takes a type name and expands to its default value"
   (check-equal? (run-example "types.rkt")
-                '("0" "False" "0" "0" "0" "System.Collections.Generic.List<int32>")))
+                '("0" "False" "0" "0" "0" "System.Collections.Generic.List<int32>" "True" "False")))
 
 (test-case "type-name-of expands to the Tui name of its argument's type"
   (define types-path (path->string (build-path examples "types.rkt")))
@@ -194,6 +264,50 @@
             '(Console.WriteLine 5000000000)
             '(Console.WriteLine (.ToString #\z)))
    '("3.5" "-10" "2" "abc" "True" "True" "True" "5000000000" "z")))
+
+(test-case "null is typed from the expected type and works as an argument"
+  (check-equal?
+   (run-tui '(define (empty? [s : string]) : bool (null? s))
+            '(Console.WriteLine (empty? null))
+            '(Console.WriteLine (null? "x"))
+            '(Console.WriteLine (String.IsNullOrEmpty null))
+            '(Console.WriteLine (= "x" null))
+            '(Console.WriteLine (= null (System.Activator.CreateInstance<System.Text.StringBuilder>)))
+            '(let ([xs (list-of "a")])
+               (.Add xs null)
+               (Console.WriteLine (.get_Count xs))))
+   '("True" "False" "True" "False" "False" "2")))
+
+(test-case "null reaches constructors and generic methods"
+  (check-equal?
+   (run-tui '(using "System.Core") '(open System.Linq)
+            '(Console.WriteLine (.get_Length (new System.Text.StringBuilder null)))
+            '(Console.WriteLine (Enumerable.Contains (list-of "a") null)))
+   '("0" "False")))
+
+(test-case "null-of declares a typed null where there is no expected type"
+  (check-equal?
+   (run-tui '(let ([s (null-of string)])
+               (Console.WriteLine (null? s))
+               (set! s "x")
+               (Console.WriteLine (null? s)))
+            '(let ([sb (null-of System.Text.StringBuilder)])
+               (Console.WriteLine (null? sb))))
+   '("True" "False" "True"))
+  (check-regexp-match #rx"null-of needs a reference type, got int32" (tui-error '(null-of int32)))
+  (check-regexp-match #rx"unknown type" (tui-error '(null-of NoSuchType))))
+
+(test-case "null is rejected where it has no reference type"
+  (check-regexp-match #rx"ambiguous call to Console.WriteLine with \\(null\\)"
+                      (tui-error '(Console.WriteLine null)))
+  (check-regexp-match #rx"null needs an expected reference type" (tui-error '(let ([x null]) x)))
+  (check-regexp-match #rx"null cannot have type int32" (tui-error '(define (f) : int null)))
+  (check-regexp-match #rx"null cannot have type int32"
+                      (tui-error '(define (k [n : int]) : int n) '(k null)))
+  (check-regexp-match #rx"cannot compare int32 with null" (tui-error '(= 1 null)))
+  (check-regexp-match #rx"cannot compare null with null" (tui-error '(= null null)))
+  (check-regexp-match #rx"null\\? needs a value, not a bare null" (tui-error '(null? null)))
+  (check-regexp-match #rx"null\\? needs a reference type, got int32" (tui-error '(null? 1))))
 
 (test-case "type errors are reported at expansion time"
   (check-regexp-match #rx"returns int32 but its body has type string"

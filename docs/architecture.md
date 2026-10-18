@@ -87,6 +87,29 @@ A macro that builds `(tui-il ...)` by hand bypasses `il`, so it has no `'tui-typ
 that case `tc` raises `internal: untyped fragment`. Build fragments with `il` or through ordinary
 Tui forms.
 
+### Hover tooltips
+
+Each `tc` call also records its expression's type for hover. `record-tooltip!` keys the type by
+source file and by the expression's `(position . span)`, and keeps the first entry for a key.
+Expressions with no source or no span are skipped. The table is per file, so a required module
+does not disturb the module being expanded.
+
+`tooltip-leaves` turns each entry into leaves `(vector stx start end text)`, following Typed
+Racket's placement. A compound expression is marked on its parens only, so an inner expression's
+leaf does not overlap its outer one. An atom is marked over its whole text. Positions are 0-based
+character offsets, which is what racket-langserver expects.
+
+racket-langserver shows the leaf text as Markdown with no code fence, so the `<` and `>` of a
+generic type are escaped with a backslash (`System.Collections.Generic.List\<int32\>`). Unescaped,
+`<int32>` is read as an HTML tag and disappears from the hover. Check Syntax in DrRacket shows the
+backslashes as they are.
+
+`tui-module-begin` clears the file's table, and `tui-tooltips` runs after `prog` in the module's
+expansion. It logs the leaves on `online-check-syntax` as a carrier syntax object, with the
+`'mouse-over-tooltips` property. racket-langserver reads that log as hover text, and the carrier
+stays in the expansion so Check Syntax can read the same property. The log message is prefixed
+with the topic, and its suffix routes it to the hover path, not Typed Racket's.
+
 ## 5. Type representation
 
 A Tui type is a datum:
@@ -121,10 +144,11 @@ not guess.
 | Source | Carried by | Used for |
 | --- | --- | --- |
 | Expanded expression | `'tui-type` on `tui-il` (`il`, `tc`) | The type of every expression, flowing upward (section 4) |
-| Expected type | `'tui-expected` (`tc/expect`) | A `fn` with no delegate name (section 10) |
+| Expected type | `'tui-expected` (`tc/expect`) | A `fn` with no delegate name (section 10), and a bare `null` (section 4) |
 | Declaration | annotations, `fun-header`, module `define` | Parameters, return types, module values |
 | CLR metadata | `clr-method` from `find-static-methods` and `find-instance-methods` | Overload candidates, parameter types, delegate `Invoke` arity |
 | Bare fn placeholder | type `(lambda n)` and struct `deferred-fn` | A bare `fn` argument before its overload is chosen |
+| Bare null placeholder | type `'null-arg` (`null-placeholder`) and struct `deferred-fn` | A bare `null` argument before its overload is chosen |
 
 ### CLR calls
 
@@ -135,13 +159,16 @@ A call to a .NET method (`compile-static-call`, `compile-instance-call`, `tui-ne
    and is kept as a `deferred-fn`.
 2. **Choose the overload** (`resolve-overload`). Each candidate is closed by `infer-targs`, and each
    argument is scored with `arg-coercion`. A placeholder matches any delegate whose `Invoke` has n
-   parameters, at cost 0. The lowest total cost wins. When costs tie, a non-generic candidate beats a
+   parameters, at cost 0. A bare null matches any reference parameter (a class, `string` or `object`)
+   at cost 0, and no value type. The lowest total cost wins. When costs tie, a non-generic candidate beats a
    generic one, as in C#. Groups are tried in order: a derived type's methods come before its bases',
-   and the first group with an applicable candidate wins. A tie that remains is an error.
+   and the first group with an applicable candidate wins. A tie that remains is an error, so
+   `Console.WriteLine null` is ambiguous.
 3. **Finish the call** (`finish-call`). If every type argument is fixed, each argument is converted to
-   its parameter type (`finish-args`), and each deferred `fn` is compiled against that type with
-   `tc/expect`. If a type argument is still open, the bare `fn`s fix it first (`compile-partial-fn`),
-   then the arguments are converted. An argument whose type is still open is an error.
+   its parameter type (`finish-args`), and each deferred `fn` or `null` is compiled against that type
+   with `tc/expect`. If a type argument is still open, the bare `fn`s fix it first (`compile-partial-fn`),
+   then the arguments are converted. A null fixes no type argument, so it is compiled after the method
+   is closed. An argument whose type is still open is an error.
 
 ### Fixing type arguments (`infer-targs`)
 
@@ -266,6 +293,10 @@ Consequences:
 - Expansion must be deterministic. A macro that reads mutable phase-1 state can break the second
   pass.
 - A name a macro introduces into a lambda is captured like any other name.
+- Hover tooltips are recorded in both passes. The first recording of a span wins, so the two
+  passes must agree on types, which they do because expansion is deterministic.
+- `%tui-tooltips` is a `define` after `prog`. A bare macro use at module level expands before
+  `prog`'s right-hand side, so the table would be empty.
 
 Lambda classes are collected in the `lifted-classes` box during expansion. `tui-lifting` and
 `tui-lifts-into` place them into the module, and `tui-module-begin` resets the box. The full design
@@ -399,6 +430,12 @@ Common messages (the exact wording is in `main.rkt` and `private/clr.rkt`):
 - `not a variable`
 - `unknown type`
 - `internal: untyped fragment` (a hand-built `tui-il` form, section 4)
+- `null needs an expected reference type` (a bare `null` with no expected type, such as in a `let`; use `null-of`)
+- `null-of needs a reference type, got X` (`null-of` with a value type)
+- `null cannot have type int32` (a bare `null` where a value type is expected)
+- `null? needs a value, not a bare null`, `null? needs a reference type, got X`
+- `cannot compare X with null`, `cannot compare null with null` (`=` with a null operand)
+- `ambiguous call to X with (null)` (a bare `null` argument that more than one overload accepts)
 
 ## 15. Tests
 
@@ -409,6 +446,9 @@ Common messages (the exact wording is in `main.rkt` and `private/clr.rkt`):
 - `tui-error form ...` returns the syntax error message, or `#f` if there is none.
 
 The REPL tests evaluate `(#%top-interaction . form)` in the module's namespace.
+
+The hover tests expand a module read from a string (`expanded-tooltips`). They check the exact
+(text, type) leaves and that the same carrier is logged on `online-check-syntax`.
 
 Run the suite with `raco test tests\tui-test.rkt`. It takes about 4 minutes. Run `raco make
 main.rkt` first if you have changed `main.rkt` or `private/*.rkt`.
@@ -432,7 +472,8 @@ and run `raco make main.rkt`.
 | (inline tests) | generic parameters bound from a `List<T>` and from a delegate variable | `generic parameters are inferred from list and delegate variable arguments` |
 | (inline tests) | type arguments as `_` or omitted at the end, and the errors for too many, uninferrable and conflicting ones | `type arguments may be _ or omitted at the end, and the rest are inferred` |
 | `macros.rkt` | hygienic macros | `Tui macros are hygienic` |
-| `types.rkt` | `default-of`, `type-name-of` | `default-of takes a type name ...`, `type-name-of expands ...` |
+| `types.rkt` | `default-of`, `type-name-of`, `null?` on a null argument | `default-of takes a type name ...`, `type-name-of expands ...`, `null is typed from the expected type and works as an argument` |
+| (inline tests) | `null-of` as a typed null in `let` and `set!`, and its rejections | `null-of declares a typed null where there is no expected type` |
 | `lists.rkt` | `list-of`, `sum-of` | `the list-of example runs`, `sum-of reads the element type ...` |
 | `linq.rkt` | LINQ over stored lambdas, reference conversions | `LINQ works with stored lambdas, library macros and reference conversions` |
 | `fnlib.rkt` | `compose` and `square` library macros | `compose checks that both arguments are Func<int32, int32>` |
@@ -443,6 +484,7 @@ and run `raco make main.rkt`.
 
 ## 17. Known limits
 
+- Hover tooltips for two expressions with the same position and span show the first one recorded. A macro that copies a form without moving it can therefore hide the type of the copy.
 - Inference is limited to exact `(mvar n)` parameters, base-type matches of generic instance
   parameters, and the bare `fn` body rule. There is no unification.
 - A parameter type inferred from a body call (Phase D) needs one overload with that name and arity.
