@@ -71,7 +71,7 @@ Two functions in `main.rkt` produce and read these:
 `tc/expect stx to` expands `stx`, checks it against `to` with `coercion`, and appends any
 conversion instructions. It raises `type mismatch: expected ..., got ...` at `stx` on failure. It
 passes the expected type to `stx` as the `'tui-expected` property. This is how a `fn` with no
-delegate name learns its type (section 7).
+delegate name learns its type (section 10).
 
 ### Types as syntax properties
 
@@ -111,33 +111,86 @@ symbol at its comma.
 
 ## 6. Type inference
 
-Inference is intentionally basic. Nothing is unified across expressions.
+Inference uses only what the compiler already knows: the types of expanded expressions, the expected
+type of a position, and CLR metadata. Nothing is unified. A type argument is fixed only by a direct
+match against an argument. If it cannot be fixed that way, the call is rejected. The compiler does
+not guess.
 
-- **Expression types** come from the expansion of each subform (section 4). Each compound form is
-  built from its children's types, so types flow upward.
-- **Generic method type arguments** (`infer-targs`) are inferred from the arguments in three ways:
-  - A parameter that is exactly `(mvar n)` fixes `!!n` to the argument's type. Every `!!n` must be
-    fixed by one type.
-  - A generic instance parameter, such as `IEnumerable<!!0>`, is matched against the argument's
-    base types (`matching-supertype`). A `List<int32>` argument fixes `!!0` to `int32`.
-  - A type argument that only bare `fn` parameters mention is left open. The `fn` body then fixes it
-    (section 10, Phase E).
-- **Overloads with generic and non-generic candidates** (`resolve-overload`): when costs tie, the
-  non-generic method wins, as in C#. `String.Concat` and `Enumerable.Max` resolve this way.
-- **Explicit type arguments** (`Name<A>` in the call) are used as given and must match the arity.
-- **Parameter types of an unannotated `fn`** (`body-param-types`, Phase D): a parameter that is a
-  direct argument of a call in the body takes the parameter type of that call's overload, if the
-  name and arity have exactly one overload, it is not generic, and the type is closed. The calls
-  are `Type.Method` (static) and `.Method recv` (instance, where `recv` is a variable with a known
-  type). Nested `fn`, `let`, `let*`, `letrec` and `define` are not scanned.
+### Sources of types
 
-Examples:
-- `(Enumerable.Where<int32> xs (fn (x) (> x 2)))` is accepted.
-- `(Enumerable.Where xs (fn (x) (> x 2)))` is also accepted when `xs` is a `List<int32>`. The list's
-  `IEnumerable<int32>` base type fixes `!!0`, and the `fn` takes `Func<int32, bool>`.
-- `(Enumerable.Sum (Enumerable.Select xs (fn (x) (* x 2))))` infers `Select`'s `TResult` from the
-  body (Phase E).
-- `(let ([f (fn (s) (String.IsNullOrEmpty s))]) ...)` infers `s : string` (Phase D).
+| Source | Carried by | Used for |
+| --- | --- | --- |
+| Expanded expression | `'tui-type` on `tui-il` (`il`, `tc`) | The type of every expression, flowing upward (section 4) |
+| Expected type | `'tui-expected` (`tc/expect`) | A `fn` with no delegate name (section 10) |
+| Declaration | annotations, `fun-header`, module `define` | Parameters, return types, module values |
+| CLR metadata | `clr-method` from `find-static-methods` and `find-instance-methods` | Overload candidates, parameter types, delegate `Invoke` arity |
+| Bare fn placeholder | type `(lambda n)` and struct `deferred-fn` | A bare `fn` argument before its overload is chosen |
+
+### CLR calls
+
+A call to a .NET method (`compile-static-call`, `compile-instance-call`, `tui-new`) runs in three steps.
+
+1. **Type the arguments** (`tc-args`). Each argument is expanded and typed. A bare `fn` is detected
+   after `local-expand` by its `tui-fn` form. It gets the type `(lambda n)`, where n is its arity,
+   and is kept as a `deferred-fn`.
+2. **Choose the overload** (`resolve-overload`). Each candidate is closed by `infer-targs`, and each
+   argument is scored with `arg-coercion`. A placeholder matches any delegate whose `Invoke` has n
+   parameters, at cost 0. The lowest total cost wins. When costs tie, a non-generic candidate beats a
+   generic one, as in C#. Groups are tried in order: a derived type's methods come before its bases',
+   and the first group with an applicable candidate wins. A tie that remains is an error.
+3. **Finish the call** (`finish-call`). If every type argument is fixed, each argument is converted to
+   its parameter type (`finish-args`), and each deferred `fn` is compiled against that type with
+   `tc/expect`. If a type argument is still open, the bare `fn`s fix it first (`compile-partial-fn`),
+   then the arguments are converted. An argument whose type is still open is an error.
+
+### Fixing type arguments (`infer-targs`)
+
+Each parameter is matched against its argument, in order:
+
+- A parameter that is exactly `(mvar n)` fixes `!!n` to the argument's type. Every use of `!!n` must
+  agree (`bind-type`).
+- A generic instance parameter, such as `IEnumerable<!!0>`, matches the argument's supertype with the
+  same generic definition (`matching-supertype`). A `List<int32>` argument fixes `!!0` to `int32`.
+- A placeholder binds nothing. A type argument that occurs only in bare-fn parameters stays open
+  (`lambda-only?`). The fn's body fixes it in `finish-call`.
+- Explicit type arguments (`Name<A>`) are used as given. Their count must match the method's arity.
+
+Other parameters are checked by `coercion` after the method is closed. Nothing else is inferred.
+
+### Parameters from a call in the body (Phase D)
+
+An unannotated `fn` parameter can take its type from a call in the body (`body-param-types`, run by
+`compile-lambda` when no delegate is given). A parameter qualifies when it is a direct argument of a
+call, and that name and arity have exactly one overload. The overload must be non-generic, and its
+parameter type at that position must be closed. Calls are `Type.Method` (static) and `.Method recv`
+(instance, where `recv` is a variable with a known type). The scan does not enter nested `fn`, `let`,
+`let*`, `letrec` or `define`. Overloaded names, such as `Console.WriteLine`, give nothing, so the
+parameter must be annotated.
+
+### Internal representation
+
+- `(mvar n)` is an unfixed method type parameter. `(lambda n)` is a bare-fn placeholder. A `#f` slot
+  in `infer-targs` means open.
+- `has-mvar?` tests for open parameters. `erase-mvars` replaces them with `object` before a type's
+  shape is inspected (`delegate-param-args`, `delegate-arity`). `tui-type->il` must never see an
+  `mvar`.
+- `subst-mvars` and `instantiate-method` close a method. A method with an open type argument is never
+  emitted.
+- Functions that do the work: `clr.rkt` has `resolve-overload`, `infer-targs`, `bind-type`,
+  `matching-supertype`, `lambda-only?`, `instantiate-method`, `arg-coercion`. `main.rkt` has `tc-args`,
+  `finish-args`, `compile-partial-fn`, `finish-call`, `body-param-types`.
+
+### Examples
+
+- `(Enumerable.Where<int32> xs (fn (x) (> x 2)))` is accepted. The explicit type argument fixes it.
+- `(Enumerable.Where xs (fn (x) (> x 2)))` is accepted when `xs` is a `List<int32>`. Its
+  `IEnumerable<int32>` base fixes `!!0`, and the `fn` takes `Func<int32, bool>`.
+- `(Enumerable.Sum (Enumerable.Select xs (fn (x) (* x 2))))` fixes `Select`'s `TSource` from `xs` and
+  its `TResult` from the body.
+- `(let ([f (fn (s) (String.IsNullOrEmpty s))]) ...)` infers `s : string`.
+- `String.Concat` and `Enumerable.Max` choose their non-generic overloads on ties.
+
+Errors from this section are listed in section 14.
 
 ## 7. Overloads and conversions
 
@@ -159,8 +212,10 @@ Reference upcasts emit no IL, because the verifier accepts a reference to a base
 
 `resolve-overload groups arg-types describe explicit` scores each candidate. A candidate must have
 the right arity and every argument must coerce. Its score is the sum of the costs. Groups are tried
-in order, and the first group with any applicable candidate wins. The lowest score wins. A tie is
-an error, `ambiguous call to ...`. No candidate gives `no overload of ... accepts (...)`.
+in order, and the first group with any applicable candidate wins. The lowest score wins. Among equal
+scores a non-generic candidate wins over a generic one. A tie that remains is an error,
+`ambiguous call to ...`. No candidate gives `no overload of ... accepts (...)`. Section 6 describes
+how type arguments are fixed before scoring.
 
 ## 8. Module-level values
 
@@ -221,7 +276,7 @@ an argument of a method that takes one. `compile-lambda` produces:
 - a generated class with one field per captured cell and an `Invoke` method;
 - a delegate over `Invoke` on an instance of that class.
 
-Without a delegate name, `fn` takes its type in one of three ways:
+Without a delegate name, `fn` takes its type in one of four ways:
 
 - **From the expected type** (`tc/expect` sets `'tui-expected`): a `define` return type or a
   parameter of a Tui function.
@@ -242,14 +297,10 @@ Without a delegate name, `fn` takes its type in one of three ways:
   Overloaded methods such as `Console.WriteLine` give no inference, so the parameter must be
   annotated.
 
-Phase E fixes a generic CLR method's type arguments from a bare `fn` argument. In
-`Enumerable.Select xs (fn (x) (* x 2))`, `xs` fixes `TSource`, and the `fn`'s body type fixes
-`TResult`. `compile-partial-fn` gives the `fn`'s parameters the types the delegate already fixes,
-leaves the open ones out, compiles the `fn`, and then binds its type with `bind-type`.
-`finish-call` checks that no type argument is still open, and then converts each argument to the
-closed parameter type. A bare `fn` cannot supply a parameter type that is only `!!n`, and a delegate
-class argument that is an unbound `!!n` cannot be inferred. Both give
-`cannot infer the type of a parameter of this fn` or `cannot infer the type arguments of ...`.
+- **From a generic call's body** (Phase E): a bare `fn` argument can fix a method type argument that
+  no other argument mentions, such as `TResult` in `Enumerable.Select`. The `fn`'s parameters take
+  the delegate's already-known types, and its body type fixes the rest. Section 6 describes the rule
+  and its limits.
 
 A lambda is a value. It can be stored with `let`, passed as an argument, returned, and invoked with
 `.Invoke`. A delegate is called with `.Invoke`, as in `(.Invoke f x)`. Writing `(f x)` for a delegate `f` is an
