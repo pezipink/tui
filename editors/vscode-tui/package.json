@@ -1,0 +1,46 @@
+{
+  "name": "tui-metadata",
+  "displayName": "Tui metadata",
+  "description": "Completion and member browsing for Tui modules, from the compiler's own expansion and CLR metadata.",
+  "version": "0.1.0",
+  "publisher": "pezipink",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:racket",
+    "onCommand:tui.browse"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "tui.browse",
+        "title": "Tui: Browse Members"
+      }
+    ],
+    "configuration": {
+      "title": "Tui",
+      "properties": {
+        "tui.racketPath": {
+          "type": "string",
+          "default": "racket",
+          "description": "The racket executable that runs the metadata helper."
+        },
+        "tui.metaServerPath": {
+          "type": "string",
+          "default": "",
+          "description": "The path to private/meta-server.rkt in the Tui repository. Leave empty to find it in the workspace folders."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test test/syntax.test.js test/helper.test.js test/completion.test.js test/extension.test.js"
+  }
+}

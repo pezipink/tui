@@ -23,9 +23,11 @@ section 11 for the exact IL forms.
 | File | Contents |
 | --- | --- |
 | `main.rkt` | The language: every Tui form, the type checker `tc`, function and lambda compilation, module and REPL expansion, phase-1 helpers and syntax classes. |
-| `private/clr.rkt` | The CLR bridge: reference configuration, type datums, metadata lookup, `coercion`, overload and generic-method resolution. |
+| `private/clr.rkt` | The CLR bridge: reference configuration, type datums, metadata lookup, `coercion`, overload and generic-method resolution, and the phase-0 declarations of records. |
 | `private/runtime.rkt` | Program assembly: `make-tui-program`, `tui-program->il`, `tui-write-exe`, `run-tui-program`. |
 | `private/meta-server.rkt` | The editor helper: JSON lines on stdio for scopes, names, types and members. See section 4. |
+| `private/type-patterns.rkt` | Type-pattern runtime (phase 0): the solver, the named-pattern registry and `match-type-pattern`. See section 12.1. |
+| `private/type-syntax-class.rkt` | Type-pattern compiler: `define-type-syntax-class`, `type-match` and `type-matches?`. See section 12.1. |
 | `tests/tui-test.rkt` | The test suite (29 tests, about 4 minutes). |
 | `tests/meta-server-test.rkt` | Tests for the editor helper's requests, in process. |
 | `editors/vscode-tui/` | The VS Code companion: completion and Browse Members, through the helper. See section 4. |
@@ -253,8 +255,10 @@ rules then apply. Otherwise, when there are no arguments, it falls back to the p
 `get_Name`. So `s.Length` reads the `Length` property of a string, and `xs.Count` reads `get_Count`.
 
 Threading works with the same forms. A bare clause `.Name` in `~>` or `~>>` becomes `(.Name prev)`,
-so `(~> "tui" .Length)` is a property read on the threaded value. A value type in the chain is boxed,
-as in any instance call.
+so `(~> "tui" .Length)` is a property read on the threaded value. A primitive value in the chain is
+boxed and its members are looked up on `object`. A struct or enum value is unboxed to a managed
+pointer for its own instance members. An inherited member such as `ToString` from `Enum` is called on
+the boxed object, since a managed pointer is not an object reference.
 
 Hover: `a.Name` is marked as one expression, and its receiver `a` has its own leaf. A threaded step is
 a compound expression, so it is marked on its first and last characters only, as for any form in the
@@ -325,11 +329,14 @@ and returns:
 | `int32` or `int64` to `float64` | 1 | `conv.r8` |
 | class or `string` to a base class or interface | 1 | none |
 | reference type to `object` | 2 | none |
-| value type to `object` | 2 | `box` |
+| primitive value type to `object` | 2 | `box` |
+| struct or enum to `object` | 2 | `box` |
+| struct or enum to an interface or base class it implements | 1 | `box` |
 
 Reference upcasts emit no IL, because the verifier accepts a reference to a base type. The cost of
 `object` is higher than any base class or interface, so `List<T>` prefers `IEnumerable<T>` over
-`object`.
+`object`. An array is a reference type whose members are System.Array's, and it has no upcast to
+another array type.
 
 `resolve-overload groups arg-types describe explicit` scores each candidate. A candidate must have
 the right arity and every argument must coerce. Its score is the sum of the costs. Groups are tried
@@ -371,6 +378,40 @@ The module-level machinery is `make-tui-global` (a `tui-global` struct bound wit
 `value-parts` (builds the field and initializer), the `tui-value-decls` macro (returns the field and
 initializer pairs for the method list), and `compile-main`, which takes the initializers. The field
 access form is `(ldsfld Program name type)`. Section 11 explains `Program`.
+
+### Records
+
+A record is a sealed class with the same module-level rules. Syntax:
+
+```racket
+(record Name [field : type] ...)
+```
+
+`record-declaration` in `main.rkt` parses the form and calls `declare-record!` in `private/clr.rkt`,
+which declares the type in the Rangi type environment at expansion time (phase 0). The descriptor has a
+public `.ctor` that takes every field in order, a private field per name, and public `get_name` and
+`set_name` methods. The type checker then sees the record like any other class. `record-class-datum`
+builds the IL class (`ldfld`, `stfld`, and the accessors) and `tui-module-begin` adds it to the program
+with `tui-program-add-class!`.
+
+Rules and details:
+
+- `tui-module-begin` calls `reset-local-declarations!` before it declares the records, so the
+  declarations of one module do not leak into the next.
+- A record's name is referenced bare (`Name`) in type positions, and `local-type-ref` finds it before
+  Rangi's namespace search, which does not look in the empty namespace. Fields are read as `p.name` and
+  `(p.get_name)`, and written as `(set! p.name e)`, which `tui-set!` rewrites to `(p.set_name e)`.
+- A record in a function body or an expression raises `record is only allowed at module level`, and
+  so does one in a REPL interaction.
+- A field cannot be `void` or repeat a name. A record name can be declared once per module.
+- A field can have an earlier record as its type. A forward reference fails as `unknown type`.
+- A record name works in type-pattern positions too. `define-type-syntax-class` can name it (`Point`),
+  or match it structurally with `has (.get_x () : int32)`, since the pattern member names are the
+  CLR metadata names. `examples/records.rkt` has these, and `type-matches?` and `type-match` run on them.
+- Owner references to a type in the same assembly use `(Name)` (for `newobj` and `call`). A type
+  position uses the bare symbol, `(class Name)`, which is what Rangi's ilasm `check-type` accepts.
+  Only `tui-type->il` differs between the two.
+
 
 ## 9. Two-pass expansion and lambda lifting
 
@@ -475,11 +516,126 @@ read types and metadata:
 | `class-of t` | the CLR class descriptor for `t` |
 | `supertypes t` | transitive base classes and interfaces, as Tui types |
 
-Syntax classes for macro arguments: `typedExpr` (`x.Type`), `typedList` (`x.Type`, `x.Elem`),
-and `typeName` (`x.Type`).
+Syntax classes for macro arguments: `typedExpr` (`x.Type`) and `typeName` (`x.Type`). Richer
+constraints are written with `define-type-syntax-class` (section 12.1).
 
 Limits: the helpers see only members whose signatures use types Tui models, so overload counts are
 smaller than the full .NET counts.
+
+### 12.1 Type patterns
+
+`define-type-syntax-class` names a type constraint and makes it a syntax class. `type-match` and
+`type-matches?` test the same patterns at phase 1. `private/type-patterns.rkt` holds the solver
+(phase 0, so its helpers run at phase 1 as well). `private/type-syntax-class.rkt` compiles patterns
+and defines the three macros. `main.rkt` only re-exports them.
+
+Pattern grammar:
+
+```
+pat     ::= _                      any type
+          | ?id                    binder; every use of the same ?id must be the same type
+          | prim                   void bool char int32 int64 float64 string object (and aliases)
+          | Name                   a closed type, named as in an annotation
+          | UserName               a pattern defined with define-type-syntax-class
+          | (Gen pat ...)          a closed generic instance; one pattern per type argument
+          | (open Gen)             any closed instance of Gen, whatever its arguments
+          | (szarray pat)          a single-dimension array
+          | (<: pat)               a base class or interface, at any depth, that matches pat
+          | (and pat ...)          all match; bindings flow left to right
+          | (or pat ...)           the first branch that matches
+          | (not pat)              does not match; binds nothing
+          | (opt pat)              pat if it matches, otherwise its ?ids are #f
+          | (exactly expr)         the type equal to the phase-1 value of expr
+          | (? pred)               pred, a procedure on types, returns true
+          | (? pred pat)           pred holds and pat matches
+          | (app fn pat)           pat matches (fn type)
+          | (has member ...)       each member matches a public overload
+member  ::= (.Name (param ...) : ret)            instance method
+          | (.Name (?T ...) (param ...) : ret)   instance method with method type parameters
+          | (static .Name ...)                   static form of either
+          | (.ctor (param ...))                  public constructor
+```
+
+Names are CLR metadata names (`.get_Item`, not `.Item`). A `?T` in a member refers to the outer
+binder unless it is declared in the member's `(?T ...)` list. A declared `?T` is local to the
+member and matches the method's own type parameter; it is not exposed as an attribute.
+
+Syntax classes and macros:
+
+- `(define-type-syntax-class Name [#:description "text"] pat)` defines `Name`. A pattern variable
+  `x:Name` accepts any expression and has `x.Type`, the type the checker gives it, plus one
+  attribute per binder written directly in `pat`. The description appears in error messages; without
+  one, the printed pattern is used.
+- A named pattern used inside another contributes its test, but its binders are not exposed on the
+  outer class.
+- `(type-match texpr [pat body ...] ... [else body ...])` runs at phase 1 and binds each `?id` in
+  its clause's body. Without a matching clause and without `else`, it raises an error.
+- `(type-matches? texpr pat)` returns a phase-1 boolean.
+
+Generic arguments match exactly, so generics are invariant. A `List<int32>` argument does not match
+`IEnumerable<int32>`. Write `<:` in the argument position to accept a subtype:
+`(<: (IEnumerable (<: (IEnumerable ?X))))` matches `List<List<int32>>` and binds `?X` to `int32`.
+
+Excerpts from `examples/lists.rkt` and `examples/type-patterns.rkt`. The full files show the rest:
+
+```racket
+; a list: IEnumerable<T> with get_Count and get_Item(int32) : T (lists.rkt)
+(define-type-syntax-class typedList
+  (and (<: (System.Collections.Generic.IEnumerable ?Elem))
+       (has (.get_Count () : int32))
+       (has (.get_Item (int32) : ?Elem))))
+
+; open and closed generics, with a named pattern inside another one
+(define-type-syntax-class dictLike
+  (<: (System.Collections.Generic.IDictionary ?K ?V)))
+(define-type-syntax-class countedDict
+  (and dictLike (has (.get_Count () : int32))))
+
+; one binder shared by an interface and a member parameter
+(define-type-syntax-class growableSeq
+  (and (<: (System.Collections.Generic.IEnumerable ?T))
+       (has (.Add (?T) : void))))
+
+; a method type parameter, solved against the signature but not exposed
+(define-type-syntax-class convertible
+  (has (.ConvertAll (?R) ((System.Converter ?T ?R)) : (System.Collections.Generic.List ?R))))
+
+; static members
+(define-type-syntax-class stringLike
+  (has (static .IsNullOrEmpty (string) : bool)))
+
+; combinators, a predicate, and a phase-1 value
+(define-type-syntax-class scalar (or string int32 int64 bool))
+(define-type-syntax-class numeric
+  (? (lambda (t) (and (memq t '(int32 int64 float64)) #t))))
+(define-for-syntax the-int-type 'int32)
+(define-type-syntax-class exactlyInt32 (exactly the-int-type))
+
+; type-match with nested open, binders, named patterns, nested generics and an else clause
+(define-syntax-parser describe
+  [(_ x:typedExpr)
+   (define msg
+     (type-match (attribute x.Type)
+       [(System.Collections.Generic.Dictionary (open System.Collections.Generic.List) ?V)
+        (format "a dictionary keyed by a list, with ~a values" (tui-type->string V))]
+       [(System.Collections.Generic.List (System.Collections.Generic.List ?X))
+        (format "a list of lists of ~a" (tui-type->string X))]
+       [(<: (System.Collections.Generic.IEnumerable (or string int32 int64 bool)))
+        "a sequence of scalars"]
+       [scalar "a scalar"]
+       [else "something else"]))
+   #`#,msg])
+```
+
+Limits:
+
+- Only members whose signatures use types Tui models are visible, so overload sets are smaller than
+  the full .NET ones.
+- `(open Gen)` checks the name and that the type has type arguments. It does not check the arity.
+- `(or ...)` takes the first branch that matches. Its branches are not checked to bind the same
+  `?id`s.
+- `szarray` patterns compile, but no example exercises them. Tui has no array-construction syntax yet.
+- A named pattern exported from one module and used from another has not been tested.
 
 ## 13. REPL
 
@@ -571,13 +727,16 @@ and run `raco make main.rkt`.
 | `macros.rkt` | hygienic macros | `Tui macros are hygienic` |
 | `types.rkt` | `default-of`, `type-name-of`, `null?` on a null argument | `default-of takes a type name ...`, `type-name-of expands ...`, `null is typed from the expected type and works as an argument` |
 | (inline tests) | `null-of` as a typed null in `let` and `set!`, and its rejections | `null-of declares a typed null where there is no expected type` |
-| `lists.rkt` | `list-of`, `sum-of` | `the list-of example runs`, `sum-of reads the element type ...` |
+| `lists.rkt` | `list-of`, `sum-of`, `typedList` built from the type-pattern language | `the list-of example runs`, `sum-of reads the element type ...`, `typedList no longer takes a dictionary's value type ...` |
+| `type-patterns.rkt` | `define-type-syntax-class`, `type-match`, `type-matches?`: generics (open and closed), nested `<:`, named patterns, members and static members, method type parameters, combinators, predicates, `exactly` | `the type-patterns example exercises generic, member, named and combinator patterns` |
+| `collect.rkt` | `type-match` choosing how to fill a collection at compile time: `List`, `HashSet`, `Dictionary`, and nested collections by recursing on the element type | `collect fills lists, sets, dictionaries and nested collections, and rejects non-collections` |
 | `linq.rkt` | LINQ over stored lambdas, reference conversions | `LINQ works with stored lambdas, library macros and reference conversions` |
 | `fnlib.rkt` | `compose` and `square` library macros | `compose checks that both arguments are Func<int32, int32>` |
 | `phase1.rkt` | metadata helpers at expansion time | `phase 1 macros read overloads, supertypes and members from metadata` |
 | `syntax-classes.rkt` | syntax classes, `define-simple-macro`, phase-1 helpers | `phase 1 definitions: syntax classes, simple macros and phase-1 helpers` |
 | `threading.rkt` | `threading`'s `~>` and `~>>` | `threading's ~> and ~>> compile to ordinary Tui calls, and a bare .Name clause reads a member` |
 | `values.rkt` | module values, `set!`, initialization order | `module values are static fields set in source order, and set! updates them` |
+| `records.rkt` | record declarations: constructor, `get_`/`set_` properties, `set!` on a field, a record field of a record type, type-syntax-classes that name `Point` or match it structurally, and `type-match` on a record | `a record has a constructor, get_ and set_ properties, and can be passed and returned` |
 
 ## 17. Known limits
 
@@ -598,7 +757,22 @@ and run `raco make main.rkt`.
 - Member reads are one dot deep. `x.Name` and `Type.Name` work bare, but `a.b.c` is an unbound
   identifier. Write `(~> a .b .c)` instead. Dotted heads inside a threaded clause, such as
   `(~> x (xs.Thing))`, are not supported and have no tests; use the bare `.Thing` clause form.
-- Error display crashes with `fprintf: ill-formed pattern string` when a message contains `~`, for
-  example an 8.3 temporary path. This is a pre-existing bug and is not fixed here.
+- Racket's default error display crashes with `fprintf: ill-formed pattern string` when a message's
+  source path contains `~`, for example an 8.3 short name in a temporary path such as `PEZ~1`. Plain
+  Racket 8.16 does the same with `raise-syntax-error`, so the fault is in Racket's error display and
+  Tui cannot fix it here. Work around it by setting `TEMP` and `TMP` to a path with no `~`, or by
+  building from such a path.
+- Type patterns (section 12.1) see only the members Tui models. `(open Gen)` checks the name and
+  that there are type arguments, not the arity. `(or ...)` does not check that its branches bind the
+  same `?id`s. `szarray` patterns compile but no example exercises them.
+- Member lookup shows only the public members whose signatures use types Tui models. Arrays and
+  structs are modeled: a `(szarray T)` or struct or enum parameter is visible, and an array can be a
+  method's return value. Tui cannot construct arrays, and it cannot name an enum constant, because a
+  static field read by qualified name, such as `System.Globalization.NumberStyles.Integer`, is an
+  unbound identifier. Enum overloads are therefore visible but cannot be given an enum argument from
+  source.
+- Arrays are not `IEnumerable<T>`, so `Enumerable` methods do not accept them, and an array is not
+  converted to an array of a base type.
+- A named pattern exported from one module and used from another has not been tested.
 - Captured cells use one array per variable. Grouping captures into one object would reduce
   allocations; see [captures.md](captures.md) section 9.

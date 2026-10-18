@@ -4,6 +4,14 @@
 (require (for-syntax racket/base syntax/parse))
 (provide sum-of)
 
+; A list is an IEnumerable<T> with a get_Count and a get_Item(int32) that returns the same T.
+; Dictionary<K, V> fails the Elem check, because its enumerator yields pairs and its indexer returns V.
+(define-type-syntax-class typedList
+  #:description "a list of T (IEnumerable<T> with get_Count and get_Item(int32) : T)"
+  (and (<: (System.Collections.Generic.IEnumerable ?Elem))
+       (has (.get_Count () : int32))
+       (has (.get_Item (int32) : ?Elem))))
+
 
 (define-syntax-parser cwl
   [(_ x:expr ... )
@@ -25,13 +33,17 @@
        [else (raise-syntax-error
               'sum-of
               (format "sum-of needs a list of int32 or string elements, got ~a"
-                      (if elem (tui-type->string elem) "a non-list"))
+                      (tui-type->string elem))
               this-syntax)]))
    #`(let ([src xs] [i 0] [total #,zero])
        (while (< i (.get_Count src))
          (set! total (+ total (.get_Item src i)))
          (set! i (+ i 1)))
-       total)])
+       total)]
+  [(_ xs:typedExpr)
+   (raise-syntax-error 'sum-of
+                       "sum-of needs a list of int32 or string elements, got a non-list"
+                       this-syntax)])
 
 (let ([names (list-of "ada" "grace")])
   (.Add names "linus")

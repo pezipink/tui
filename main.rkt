@@ -6,15 +6,18 @@
 ; .NET are resolved at expansion time by reading the referenced assemblies with Rangi's reader.
 ; The module's program is kept as ilasm datums, assembled with Rangi when it runs.
 (require (for-syntax racket/base racket/list racket/string syntax/parse syntax/parse/define
-                     "private/clr.rkt")
+                     "private/clr.rkt" "private/type-patterns.rkt"
+                     "private/type-syntax-class.rkt")
          syntax/parse/define
          (only-in syntax/parse define-syntax-class define-splicing-syntax-class pattern)
-         "private/runtime.rkt")
+         "private/runtime.rkt"
+         "private/type-syntax-class.rkt")
 
 (provide (rename-out [tui-module-begin #%module-begin]
                      [tui-top-interaction #%top-interaction]
                      [tui-app #%app] [tui-datum #%datum] [tui-top #%top]
                      [tui-define define] [tui-let let] [tui-set! set!] [tui-if if]
+                     [tui-record record]
                      [tui-while while] [tui-begin begin] [tui-and and] [tui-or or] [tui-not not]
                      [tui-new new] [tui-list-of list-of] [tui-fn fn]
                      [tui-+ +] [tui-- -] [tui-* *] [tui-/ /] [tui-% %]
@@ -24,13 +27,15 @@
          using open define-syntax-rule define-syntax define-syntax-parser require provide
          define-simple-macro define-syntax-class define-splicing-syntax-class pattern
          begin-for-syntax define-for-syntax define-syntaxes
+         define-type-syntax-class type-match type-matches?
          for-syntax file
          ... _ (for-syntax ... _)
          (for-syntax tui-type-of tui-member-return-type tui-type->string class-of
                      tui-resolve-type tui-has-default-ctor?
                      tui-static-overloads tui-instance-overloads tui-member-names
                      supertypes
-                     typedExpr typedList typeName))
+                     typedExpr typeName
+                     type-match type-matches?))
 
 (module reader syntax/module-reader tui)
 
@@ -61,6 +66,8 @@
 (define-syntax tui-define (top-level-only "define"))
 (define-syntax using (top-level-only "using"))
 (define-syntax open (top-level-only "open"))
+(define-tui-form (tui-record stx)
+  (raise-syntax-error 'tui "record is only allowed at module level" stx))
 
 (begin-for-syntax
   ; Per-method state: local variable types (in slot order) and a label counter. parent is the
@@ -638,7 +645,7 @@
                 (cond
                   [(not t) (cons '() '())]
                   [else
-                   (define owner (if (value-type? t) 'object t))
+                   (define owner (if (primitive-value-type? t) 'object t))
                    (define rest (cdr args))
                    (cons (arity-overloads (find-instance-methods owner (cadr m)) (length rest))
                          rest)]))]
@@ -646,7 +653,7 @@
            => (λ (v)
                 (define m (dotted-match name))
                 (define t (tui-var-type v))
-                (define owner (if (value-type? t) 'object t))
+                (define owner (if (primitive-value-type? t) 'object t))
                 (cons (arity-overloads (find-instance-methods owner (caddr m)) (length args))
                       args))]
           [(regexp-match #rx"^(.+)\\.([^.]+)$" name)
@@ -798,11 +805,13 @@
             (if (and (pair? (cdr l)) (identifier? (cadr l))) 'value 'define))]
          [(free-identifier=? #'h #'using) 'using]
          [(free-identifier=? #'h #'open) 'open]
+         [(free-identifier=? #'h #'tui-record) 'record]
          [(ormap (λ (k) (free-identifier=? #'h k))
                  (list #'define-syntax-rule #'define-syntax #'define-syntax-parser
                        #'define-simple-macro #'define-syntax-class
                        #'define-splicing-syntax-class
                        #'begin-for-syntax #'define-for-syntax #'define-syntaxes
+                       #'define-type-syntax-class
                        #'require #'provide))
           'passthrough]
          [else 'expr])]
@@ -824,7 +833,51 @@
     (define-values (name pnames ptypes ret body) (fun-header def))
     #`(define-syntax #,name
         (make-tui-fun '#,name (list #,@(for/list ([t ptypes]) #`(quote-syntax #,t)))
-                      (quote-syntax #,ret)))))
+                      (quote-syntax #,ret))))
+
+  ; (record Name [field : type] ...): declares the type in the local assembly, so later code in the
+  ; module is checked against it, and returns the ilasm datum of its class.
+  (define (record-declaration f)
+    (syntax-parse f
+      [(_ name:id [field:id (~datum :) type:id] ...+)
+       (define fields
+         (for/list ([x (in-list (syntax->list #'(field ...)))]
+                    [t (in-list (syntax->list #'(type ...)))])
+           (define ty (ann->type t))
+           (when (eq? ty 'void) (raise-syntax-error 'tui "a record field cannot be void" t))
+           (cons (symbol->string (syntax-e x)) ty)))
+       (when (check-duplicates (map car fields))
+         (raise-syntax-error 'tui "duplicate field name in record" f))
+       (define n (symbol->string (syntax-e #'name)))
+       (with-clr f (λ () (declare-record! n fields)))
+       (record-class-datum n fields)]
+      [_ (raise-syntax-error 'tui "expected (record Name [field : type] ...)" f)]))
+
+  ; The class of a record (name, fields as (name . tui-type)): a constructor that takes each field,
+  ; a private field per name, and get_name and set_name accessors.
+  (define (record-class-datum name fields)
+    (define cname (string->symbol name))
+    (define (fname f) (string->symbol (car f)))
+    (define (ftype f) (tui-type->il (cdr f)))
+    (define (arg-load i)
+      (if (< i 4) (list (string->symbol (format "ldarg.~a" i))) (list 'ldarg.s i)))
+    (define (accessors f)
+      (define t (ftype f))
+      (list `(.method (public) ,t ,(string->symbol (string-append "get_" (car f))) () (cil managed)
+                      ((ldarg.0) (ldfld ,cname ,(fname f) ,t) (ret)))
+            `(.method (public) void ,(string->symbol (string-append "set_" (car f))) (,t)
+                      (cil managed)
+                      ((ldarg.0) (ldarg.1) (stfld ,cname ,(fname f) ,t) (ret)))))
+    (define ctor
+      `(.method (public specialname rtspecialname) void .ctor ,(map ftype fields) (cil managed)
+                ((ldarg.0) (call void (mscorlib System.Object) .ctor ())
+                 ,@(append* (for/list ([f (in-list fields)] [i (in-naturals 1)])
+                              `((ldarg.0) ,(arg-load i) (stfld ,cname ,(fname f) ,(ftype f)))))
+                 (ret))))
+    `(.class (public auto ansi sealed) ,cname
+             (,@(for/list ([f (in-list fields)]) `(.field (private) ,(ftype f) ,(fname f)))
+              ,ctor
+              ,@(append-map accessors fields)))))
 
 ;; Phase 1 queries for user macros: the type checker, and the CLR metadata behind a type.
 (begin-for-syntax
@@ -870,9 +923,9 @@
   )
 
 ;; Syntax classes that give user macros the Tui types of their arguments. A pattern variable x of
-;; class typedExpr has x.Type, the type the checker gives the expression. typedList also has x.Elem,
-;; the return type of get_Item, or #f when there is none. typeName matches a type name and has
-;; x.Type, the type it names.
+;; class typedExpr has x.Type, the type the checker gives the expression. typeName matches a type
+;; name and has x.Type, the type it names. Richer constraints, such as typedList, are built with
+;; define-type-syntax-class (see private/type-syntax-class.rkt).
 ; The attribute expressions run at phase 1, so the classes go in a begin-for-syntax beside the helpers.
 (begin-for-syntax
   (define-syntax-class typedExpr
@@ -880,16 +933,14 @@
     (pattern e
       #:attr Type (tui-type-of #'e)))
 
-  (define-syntax-class typedList
-    #:attributes (Type Elem)
-    (pattern e
-      #:attr Type (tui-type-of #'e)
-      #:attr Elem (tui-member-return-type (attribute Type) "get_Item")))
-
   (define-syntax-class typeName
     #:attributes (Type)
     (pattern t:id
       #:attr Type (tui-resolve-type #'t))))
+
+; The type-pattern solver reads expression types through this hook (see type-patterns.rkt).
+(begin-for-syntax
+  (set-type-of-hook! tui-type-of))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Module and REPL
@@ -902,6 +953,7 @@
      (define refs (cons mscorlib-path (map using-path (of 'using))))
      (define opens (cons "System" (map open-namespace (of 'open))))
      (tui-configure! refs opens)
+     (reset-local-declarations!)
      (set-box! lifted-classes '())
      (hash-remove! tooltip-tables (syntax-source stx))
      (hash-remove! scope-records (syntax-source stx))
@@ -920,6 +972,9 @@
        (for/list ([v vals])
          (let ([l (syntax->list v)]) #`(#,(list-ref l 1) #,(list-ref l 3)))))
      (with-syntax ([prog (datum->syntax stx '%tui-program)]
+                   ; records are declared before any function or value is checked
+                   [(rec ...) (for/list ([r (of 'record)])
+                                (datum->syntax stx (record-declaration r)))]
                    [(decl ...) (append (map fun-declaration defs) val-decls)]
                    [(name ...) (for/list ([d defs])
                                  (let-values ([(n p t r b) (fun-header d)]) n))]
@@ -935,9 +990,11 @@
           decl ...
           (define prog
             (tui-lifting
-             (make-tui-program (tui-reference-list)
-                               (append (list (cons 'name (tui-method def)) ...) vdecl ...)
-                               (tui-main (vinit ...) stmt ...))))
+             (let ([p (make-tui-program (tui-reference-list)
+                                        (append (list (cons 'name (tui-method def)) ...) vdecl ...)
+                                        (tui-main (vinit ...) stmt ...))])
+               (tui-program-add-class! p (quote rec)) ...
+               p)))
           ; after prog, so every method and expression of the module has been recorded
           (define %tui-tooltips (tui-tooltips #,(datum->syntax #f (syntax-source stx))))
           (define %tui-scopes (tui-scopes #,(datum->syntax #f (syntax-source stx))))
@@ -1184,17 +1241,25 @@
     (define-values (m* arg-code) (finish-call stx tys codes convs m))
     (il (clr-method-ret m*) (append arg-code (list (clr-call-instr 'call m*)))))
 
-  ; A value-type receiver is boxed and dispatched through System.Object (ToString and friends).
+  ; A primitive receiver is boxed and dispatched through System.Object (ToString and friends). A
+  ; struct or enum receiver is unboxed to a managed pointer, the `this` its own methods take. A
+  ; method inherited from a reference base class (ToString from Enum) takes an object reference, so
+  ; that receiver stays boxed.
   (define (compile-instance-call stx head method-name args explicit)
     (when (null? args)
       (raise-syntax-error 'tui (format ".~a needs a receiver" method-name) stx))
     (define-values (rty rcode) (tc (car args)))
     (define-values (tys codes) (tc-args (cdr args)))
-    (define-values (owner recv-code)
+    (define-values (owner recv-code boxed-code)
       (cond
-        [(value-type? rty) (values 'object (append rcode `((box ,(tui-type->il rty)))))]
+        [(primitive-value-type? rty)
+         (define boxed (append rcode `((box ,(tui-type->il rty)))))
+         (values 'object boxed boxed)]
+        [(value-type? rty)
+         (define il (tui-type->il rty))
+         (values rty (append rcode `((box ,il) (unbox ,il))) (append rcode `((box ,il))))]
         [(eq? rty 'void) (raise-syntax-error 'tui "receiver has type void" (car args))]
-        [else (values rty rcode)]))
+        [else (values rty rcode #f)]))
     (define (lookup name) (with-clr head (λ () (find-instance-methods owner name))))
     (define property? (null? (cdr args)))
     (define groups0 (lookup method-name))
@@ -1209,8 +1274,9 @@
                                             (format "~a.~a" (tui-type->string owner) method-name)
                                             explicit))))
     (define-values (m* arg-code) (finish-call stx tys codes convs m))
+    (define recv (if (and boxed-code (not (equal? (clr-method-owner m) rty))) boxed-code recv-code))
     (il (clr-method-ret m*)
-        (append recv-code arg-code
+        (append recv arg-code
                 (list (clr-call-instr 'callvirt m*))))))
 
 ; (new Type arg ...) calls a public constructor.
@@ -1307,7 +1373,15 @@
   (syntax-parse stx
     [(_ x:id e)
      (define v (syntax-local-value #'x (λ () #f)))
+     (define name (symbol->string (syntax-e #'x)))
      (cond
+       [(and (not (tui-var? v)) (dotted-match name) (local-receiver #'x name))
+        ; (set! p.x e) is the setter call (p.set_x e), so it is checked like any other call
+        (define m (dotted-match name))
+        (define setter (datum->syntax #'x (string->symbol (format "~a.set_~a" (cadr m) (caddr m)))
+                                      #'x))
+        (define-values (ty code) (tc (datum->syntax #'x (list setter #'e) #'x) #f #'x))
+        (il ty code)]
        [(tui-global? v)
         (check-global-scope v #'x)
         (define ty (global-type v))

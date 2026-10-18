@@ -253,6 +253,24 @@
                       (tui-error `(require (file ,(path->string (build-path examples "lists.rkt"))))
                                  '(sum-of 1))))
 
+(test-case "typedList no longer takes a dictionary's value type as the element type"
+  (check-regexp-match #rx"sum-of needs a list .* got a non-list"
+                      (tui-error `(require (file ,(path->string (build-path examples "lists.rkt"))))
+                                 '(sum-of (new |System.Collections.Generic.Dictionary<string,int32>|)))))
+
+(test-case "the type-patterns example exercises generic, member, named and combinator patterns"
+  (check-equal? (run-example "type-patterns.rkt")
+                '("2" "7" "string => int32" "counted" "uncounted" "string" "int32" "True"
+                  "numeric" "scalar" "scalar" "exactly int32" "not int32" "something else"
+                  "a list of lists of int32" "a scalar" "a sequence of scalars" "a scalar"
+                  "0" "0" "False" "dict string => list of int32" "unsupported")))
+
+(test-case "collect fills lists, sets, dictionaries and nested collections, and rejects non-collections"
+  (check-equal? (run-example "collect.rkt") '("3" "2" "2" "2" "2" "3"))
+  (check-regexp-match #rx"System.Text.StringBuilder is not a collection type"
+                      (tui-error `(require (file ,(path->string (build-path examples "collect.rkt"))))
+                                 '(collect |System.Text.StringBuilder| 1))))
+
 (test-case "list-of rejects elements and calls that do not match its type"
   (check-regexp-match #rx"expected int32, got string" (tui-error '(list-of 1 "a")))
   (check-regexp-match #rx"no overload of .*Add accepts \\(int32\\)"
@@ -307,6 +325,16 @@
 
 (test-case "a member missing on a numeric literal is a compile error"
   (check-not-false (tui-error '(Console.WriteLine (1.NoSuchMember)))))
+
+(test-case "array-typed and struct-typed members are visible and callable"
+  (check-equal?
+   (run-tui '(Console.WriteLine (.get_Length (.ToCharArray "abc")))
+            '(Console.WriteLine (.Length (.Split "a,b,c" (.ToCharArray ","))))
+            '(Console.WriteLine (String.Join "-" (.Split "a b c" (.ToCharArray " "))))
+            '(Console.WriteLine (> (.Length (System.IO.Path.GetInvalidFileNameChars)) 0))
+            '(Console.WriteLine (.ToString (.DayOfWeek (DateTime.Parse "2024-01-01"))))
+            '(Console.WriteLine (Int32.Parse "42")))
+   '("3" "3" "a-b-c" "True" "Monday" "42")))
 
 (test-case "null is typed from the expected type and works as an argument"
   (check-equal?
@@ -654,7 +682,7 @@
 
 (test-case "phase 1 macros read overloads, supertypes and members from metadata"
   (check-equal? (run-example "phase1.rkt")
-                '("11" "9" "True" "False" "True" "False" "4" "Equals" "55")))
+                '("18" "19" "True" "False" "True" "False" "4" "Equals" "55")))
 
 (test-case "threading's ~> and ~>> compile to ordinary Tui calls"
   (check-equal? (run-example "threading.rkt") '("14" "5" "11" "TUI" "pipe" "3"))
@@ -750,5 +778,35 @@
                      (eval (namespace-syntax-introduce
                             (datum->syntax #f '(#%top-interaction define x : int 1)))))))
   (check-regexp-match #rx"expected \\(define name : type expr\\)"
-                      (tui-error '(define x : int))))
+                      (tui-error '(define x : int)))
+  (check-exn #rx"record is only allowed at module level"
+             (λ () (parameterize ([current-namespace ns])
+                     (eval (namespace-syntax-introduce
+                            (datum->syntax #f '(#%top-interaction record P [x : int32]))))))))
+
+(test-case "a record has a constructor, get_ and set_ properties, and can be passed and returned"
+  (check-equal? (run-example "records.rkt")
+                '("3" "10" "7" "15" "7" "Ada" "36" "6"
+                  "a Point" "a Line" "something else" "point" "segment" "other" "3" "int32" "7")))
+
+(test-case "record declarations are checked"
+  (check-regexp-match #rx"record is only allowed at module level"
+                      (tui-error '(define (f) : int (let ([r (record P [x : int32])]) 1))))
+  (check-regexp-match #rx"duplicate field name"
+                      (tui-error '(record P [x : int32] [x : int32])))
+  (check-regexp-match #rx"a record field cannot be void"
+                      (tui-error '(record P [x : void])))
+  (check-regexp-match #rx"P is already declared"
+                      (tui-error '(record P [x : int32]) '(record P [y : int32])))
+  (check-regexp-match #rx"unknown type"
+                      (tui-error '(record Q [a : Later]) '(record Later [x : int32]))))
+
+(test-case "record members are checked where they are used"
+  (check-regexp-match #rx"has no public instance method or property z"
+                      (tui-error '(record P [x : int32]) '(define (g [p : P]) : int p.z)))
+  (check-regexp-match #rx"no overload of P.set_x accepts \\(string\\)"
+                      (tui-error '(record P [x : int32])
+                                 '(define (k [p : P]) : int (begin (set! p.x "s") 1))))
+  (check-regexp-match #rx"no overload of new P accepts \\(\\)"
+                      (tui-error '(record P [x : int32]) '(define (m) : P (new P)))))
 

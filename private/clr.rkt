@@ -5,16 +5,21 @@
 ;
 ; Tui types are plain datums so they can be quoted into syntax and stored in bindings:
 ;   void bool char int32 int64 float64 string object
-;   (class "AssemblyName" "Namespace" "Name" (arg ...))   any other reference type, with its type arguments
+;   (class "AssemblyName" "Namespace" "Name" (arg ...))   a class, struct or enum, with its type arguments
+;   (szarray elem)                                        a single-dimensional array of elem
+; Whether a class is a struct or enum comes from its descriptor (see value-type?).
 (require racket/string racket/promise racket/list         rangi/src/types/canon rangi/src/types/desc rangi/src/types/reference
          (only-in rangi/src/types/provider make-env make-declaration-provider prefer-local-policy
-                  first-match-policy env-type [resolve-type-name find-type-name]))
+                  first-match-policy env-type declare-type! declare-member! complete-type!
+                  declaration-state [resolve-type-name find-type-name]))
 (provide reference-assemblies-dir mscorlib-path
          tui-configure! tui-add-reference! tui-add-open! tui-references tui-opens
-         resolve-type-name generic-instance string->tui-type split-type-args class-of tui-type->il
-         tui-type->string value-type? numeric-type? coercion
+         resolve-type-name resolve-ref ref->tui
+         generic-instance string->tui-type split-type-args class-of tui-type->il
+         tui-type->string value-type? primitive-value-type? numeric-type? coercion
          (struct-out clr-method) find-static-methods find-instance-methods find-constructors
          resolve-overload owner->il base-type supertypes type-methods
+         declare-record! reset-local-declarations!
          lambda-placeholder lambda-placeholder? null-placeholder null-placeholder? reference-type?
          delegate-type?
          class-args has-mvar? erase-mvars delegate-param-args bind-type subst-mvars instantiate-method)
@@ -64,6 +69,33 @@
 (define local-asm "TuiModule")
 (define local-provider (make-declaration-provider local-asm))
 
+; Forgets the record types declared so far. Each module's expansion starts with none.
+(define (reset-local-declarations!)
+  (set! local-provider (make-declaration-provider local-asm))
+  (set! current-env #f))
+
+; Declares a record type in the local assembly, so the type checker sees it before any module code
+; is checked. fields is a list of (name . tui-type). The record has a constructor that takes every
+; field, a private field per name, and get_name and set_name accessors, which read and write it as
+; a property.
+(define (declare-record! name fields)
+  (define r (type-ref local-asm "" name 0 'class '()))
+  (when (declaration-state local-provider r)
+    (error 'tui "~a is already declared" name))
+  (define types (for/list ([f (in-list fields)]) (tui->ref (cdr f))))
+  (declare-type! local-provider
+                 (type-desc r 'class #f #t (delay (primitive-ref 'object))
+                            (delay '()) (delay '()) (delay '())))
+  (declare-member! local-provider r
+                   (method-desc r ".ctor" #t #f #f #f #f 0 types 'void))
+  (for ([f (in-list fields)] [t (in-list types)])
+    (define n (car f))
+    (declare-member! local-provider r (field-desc r n #f #f t))
+    (declare-member! local-provider r (method-desc r (string-append "get_" n) #t #f #f #f #f 0 '() t))
+    (declare-member! local-provider r
+                     (method-desc r (string-append "set_" n) #t #f #f #f #f 0 (list t) 'void)))
+  (complete-type! local-provider r))
+
 (define ref-providers (make-hash))   ; path -> reference provider
 (define (ref-provider path)
   (hash-ref! ref-providers path
@@ -95,23 +127,30 @@
   (cond
     [(type-param? r)
      (and (eq? (type-param-owner r) 'method) (list 'mvar (type-param-index r)))]
-    [(and (type-ref? r) (eq? (type-ref-kind r) 'class) (pair? (type-ref-args r)))
+    [(and (type-ref? r) (memq (type-ref-kind r) '(class valuetype)) (pair? (type-ref-args r)))
      (define args (map sig->tui (type-ref-args r)))
      (and (andmap values args)
           (list 'class (type-ref-asm r) (type-ref-namespace r) (type-ref-name r) args))]
+    [(and (type-ref? r) (eq? (type-ref-kind r) 'szarray))
+     (define e (sig->tui (car (type-ref-args r))))
+     (and e (list 'szarray e))]
     [else (ref->tui r)]))
 
-; A reference as a Tui type, or #f when Tui does not model it (other valuetypes, arrays, pointers,
-; byrefs and type parameters).
+; A reference as a Tui type, or #f when Tui does not model it (pointers, byrefs, multi-dimensional
+; arrays and type parameters).
 (define (ref->tui r)
   (cond
     [(not (type-ref? r)) #f]
     [(hash-ref tui-of-primitive r #f) => values]
-    [(not (eq? (type-ref-kind r) 'class)) #f]
+    [(eq? (type-ref-kind r) 'szarray)
+     (define e (ref->tui (car (type-ref-args r))))
+     (and e (list 'szarray e))]
+    [(not (memq (type-ref-kind r) '(class valuetype))) #f]
     [else
      (define args (map ref->tui (type-ref-args r)))
      (and (andmap values args)
           (list 'class (type-ref-asm r) (type-ref-namespace r) (type-ref-name r) args))]))
+
 
 ; The closed reference a class type names, or #f. A Tui class has no arity suffix, so the open
 ; type is tried at each arity up to its argument count, highest first. A nested type may take
@@ -119,6 +158,9 @@
 (define (tui->ref t)
   (cond
     [(symbol? t) (tui-prim-ref t)]
+    [(szarray-type? t)
+     (define e (tui->ref (szarray-elem t)))
+     (and e (type-ref #f "" "" 0 'szarray (list e)))]
     [else
      (define args (map tui->ref (class-args t)))
      (define name (cadddr t))
@@ -130,8 +172,17 @@
               (and d (with-args (type-desc-ref d) args)))))]))
 
 (define (resolve-ref id arity)
-  (find-type-name (the-env) id #:arity arity
-                  #:policy (prefer-local-policy local-asm first-match-policy)))
+  (or (local-type-ref id arity)
+      (find-type-name (the-env) id #:arity arity
+                      #:policy (prefer-local-policy local-asm first-match-policy))))
+
+; A record declared in this module. Records have no namespace, which the opened namespaces never
+; search, so a bare name is looked up here first. Local types shadow imported ones.
+(define (local-type-ref id arity)
+  (define text (symbol->string (syntax-e id)))
+  (and (= arity 0) (not (regexp-match? #rx"[.]" text))
+       (let ([d (env-type (the-env) (type-ref local-asm "" text 0 'class '()))])
+         (and d (type-desc-ref d)))))
 
 (define (sub-id id text) (datum->syntax id (string->symbol text) id))
 
@@ -189,7 +240,22 @@
   (resolve-type-name (datum->syntax #f (string->symbol full))))
 
 (define value-types '(bool char int32 int64 float64))
-(define (value-type? t) (and (memq t value-types) #t))
+
+(define (szarray-type? t) (and (pair? t) (eq? (car t) 'szarray)))
+(define (szarray-elem t) (cadr t))
+
+; A primitive's instance members are those of System.Object: its value is boxed to dispatch them.
+(define (primitive-value-type? t) (and (memq t value-types) #t))
+
+; A primitive value type, or a struct or enum class (told apart by its descriptor).
+(define (value-type? t)
+  (cond
+    [(memq t value-types) #t]
+    [(and (pair? t) (eq? (car t) 'class))
+     (define d (class-desc t))
+     (and d (memq (type-desc-shape d) '(valuetype enum)) #t)]
+    [else #f]))
+
 (define (numeric-type? t) (and (memq t '(int32 int64 float64)) #t))
 
 ; The type of a bare fn argument during overload resolution: a fn of n parameters, whose delegate
@@ -208,6 +274,7 @@
 
 (define (tui-type->string t)
   (cond
+    [(szarray-type? t) (string-append (tui-type->string (szarray-elem t)) "[]")]
     [(and (pair? t) (eq? (car t) 'class))
      (define args (class-args t))
      (string-append (full-name (caddr t) (cadddr t))
@@ -223,16 +290,26 @@
   (cond
     [(eq? t 'bool) 'boolean]
     [(memq t '(void char int32 int64 float64 string object)) t]
-    [(null? (class-args t)) (list 'class (owner->il t))]
+    [(szarray-type? t) (list 'szarray (tui-type->il (szarray-elem t)))]
+    [(and (null? (class-args t)) (equal? (cadr t) local-asm))
+     (list (il-kind t) (string->symbol (full-name (caddr t) (cadddr t))))]
+    [(null? (class-args t)) (list (il-kind t) (owner->il t))]
     [else (owner->il t)]))
 
+; The ilasm keyword of a class type: valuetype for a struct or enum, class otherwise.
+(define (il-kind t) (if (value-type? t) 'valuetype 'class))
+
 ; (class asm ns name args) -> the owner form Rangi uses for calls and newobj: (asm Ns.Name), or
-; (class (asm Ns.Name) (arg ...)) for a generic instance.
+; (class (asm Ns.Name) (arg ...)) for a generic instance (valuetype for a generic struct). A type
+; declared in this module is named without an assembly, as (Ns.Name), like a lambda class.
 (define (owner->il t)
-  (define owner (list (string->symbol (cadr t)) (string->symbol (full-name (caddr t) (cadddr t)))))
+  (define name (string->symbol (full-name (caddr t) (cadddr t))))
+  (define owner (if (equal? (cadr t) local-asm)
+                    (list name)
+                    (list (string->symbol (cadr t)) name)))
   (if (null? (class-args t))
       owner
-      (list 'class owner (map tui-type->il (class-args t)))))
+      (list (il-kind t) owner (map tui-type->il (class-args t)))))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Implicit conversions, used for arguments and returns: (cons cost instructions) or #f.
@@ -243,18 +320,28 @@
     ; object costs more than a base class or interface, so List<T> prefers IEnumerable<T> to object
     [(and (eq? to 'object) (not (value-type? from)) (not (eq? from 'void))) '(2)]
     [(and (eq? to 'object) (value-type? from)) `(2 (box ,(tui-type->il from)))]
+    ; a struct or enum boxes to an interface or base class it implements
+    [(and (value-type? from) (pair? to) (member to (supertypes from))) `(1 (box ,(tui-type->il from)))]
     [(and (eq? from 'int32) (eq? to 'int64)) '(1 (conv.i8))]
     [(and (memq from '(int32 int64)) (eq? to 'float64)) '(1 (conv.r8))]
     [(reference-upcast? from to) '(1)]
     [else #f]))
 
-; An implicit reference conversion: a class (or string) to one of its base classes or interfaces,
-; with the type arguments those supertypes have in the closed class. The IL needs no instruction.
+; An implicit reference conversion: a class (or string, or array) to one of its base classes or
+; interfaces, with the type arguments those supertypes have in the closed class. The IL needs no
+; instruction. A value type is never upcast this way (it is boxed instead, see coercion).
 (define (reference-upcast? from to)
   (and (pair? to)
        (or (pair? from) (eq? from 'string))
-       (member to (supertypes (class-of from)))
+       (not (value-type? from))
+       (let ([c (receiver-class from)])
+         (or (equal? c to) (and (member to (supertypes c)) #t)))
        #t))
+
+; The class whose members a value of type t has: an array's are System.Array's, and a string's or
+; object's are those of System.String or System.Object (see class-of).
+(define (receiver-class t)
+  (if (szarray-type? t) (list 'class core-asm "System" "Array" '()) (class-of t)))
 
 ; Every base class and interface of a class type, transitively, as Tui types.
 (define (supertypes t)
@@ -293,7 +380,7 @@
 
 ; The descriptor of a class type, or #f.
 (define (class-desc t)
-  (define r (and (pair? t) (tui->ref t)))
+  (define r (and (pair? t) (eq? (car t) 'class) (tui->ref t)))
   (and r (env-type (the-env) r)))
 
 
@@ -336,10 +423,13 @@
        [(method) (string->symbol (format "!!~a" (type-param-index t)))]
        [else #f])]
     [(not (has-type-param? t)) (let ([tui (ref->tui t)]) (and tui (tui-type->il tui)))]
-    [(and (type-ref? t) (eq? (type-ref-kind t) 'class))
+    [(and (type-ref? t) (eq? (type-ref-kind t) 'szarray))
+     (define e (open-il (car (type-ref-args t))))
+     (and e (list 'szarray e))]
+    [(and (type-ref? t) (memq (type-ref-kind t) '(class valuetype)))
      (define args (map open-il (type-ref-args t)))
      (and (andmap values args)
-          (list 'class
+          (list (type-ref-kind t)
                 (list (string->symbol (type-ref-asm t))
                       (string->symbol (full-name (type-ref-namespace t) (type-ref-name t))))
                 args))]
@@ -357,17 +447,26 @@
   (define b (and d (force (type-desc-base d))))
   (and b (class-of (ref->tui b))))
 
-; type-name is a source string like "System.Console" or "Console".
+; type-name is a source string like "System.Console" or "Console". A primitive name such as Int32
+; names its System class for static members.
+(define primitive-classes
+  '((bool . "Boolean") (char . "Char") (int32 . "Int32") (int64 . "Int64") (float64 . "Double")))
+
 (define (find-static-methods type-name method-name)
   (define t (resolve-clr-type-name type-name))
-  (and t
+  (define owner
+    (cond
+      [(assq t primitive-classes) => (λ (p) (list 'class core-asm "System" (cdr p) '()))]
+      [t (class-of t)]
+      [else #f]))
+  (and owner
        (filter (λ (m) (and (clr-method-static? m) (equal? (clr-method-name m) method-name)))
-               (type-methods (class-of t)))))
+               (type-methods owner))))
 
 ; Instance methods named method-name on t and its base types, most derived first, as a list of
 ; groups (one group per type in the chain).
 (define (find-instance-methods t method-name)
-  (let loop ([t (class-of t)] [acc '()])
+  (let loop ([t (receiver-class t)] [acc '()])
     (cond
       [(not t) (reverse acc)]
       [else
@@ -426,6 +525,7 @@
     [(and (pair? t) (eq? (car t) 'mvar)) 'object]
     [(and (pair? t) (eq? (car t) 'class))
      (list 'class (cadr t) (caddr t) (cadddr t) (map erase-mvars (class-args t)))]
+    [(szarray-type? t) (list 'szarray (erase-mvars (szarray-elem t)))]
     [else t]))
 
 ; For delegate type d, whose arguments may hold unbound (mvar n): the argument index that each
@@ -470,6 +570,8 @@
      (or (not s)
          (for/and ([pp (in-list (class-args p))] [sa (in-list (class-args s))])
            (bind-type pp sa slots fixed)))]
+    [(and (szarray-type? p) (has-mvar? p) (szarray-type? a))
+     (bind-type (szarray-elem p) (szarray-elem a) slots fixed)]
     [else #t]))
 
 ; Whether type parameter i occurs in some bare fn parameter and in no other parameter, so that the
@@ -507,6 +609,7 @@
     [(and (pair? t) (eq? (car t) 'mvar)) (or (list-ref targs (cadr t)) t)]
     [(and (pair? t) (eq? (car t) 'class))
      (list 'class (cadr t) (caddr t) (cadddr t) (map (λ (a) (subst-mvars a targs)) (class-args t)))]
+    [(szarray-type? t) (list 'szarray (subst-mvars (szarray-elem t) targs))]
     [else t]))
 
 ; The closed method at type arguments targs: each (mvar n) becomes the nth argument. A #f
