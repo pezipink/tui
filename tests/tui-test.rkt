@@ -332,6 +332,72 @@
                (Console.WriteLine (.Invoke next))))
    '("11" "12")))
 
+(test-case "each inference source works with and without annotations"
+  (define (int-list . vals)
+   `(let ([xs (new |System.Collections.Generic.List<int32>|)])
+      ,@(for/list ([v vals]) `(.Add xs ,v))
+      xs))
+  ; expected type: a define return type, an annotated parameter checked against it
+  (check-equal? (run-tui '(define (sq) : |Func<int32, int32>| (fn ([n : int]) (* n n)))
+                         '(Console.WriteLine (.Invoke (sq) 9)))
+                '("81"))
+  (check-equal? (run-tui '(define (f) : |Func<string, bool>| (fn (s) (String.IsNullOrEmpty s)))
+                         '(Console.WriteLine (.Invoke (f) "x")))
+                '("False"))
+  (check-equal? (run-tui '(define (hi) : |System.Action| (fn () (Console.WriteLine "hi")))
+                         '(.Invoke (hi)))
+                '("hi"))
+  (check-equal? (run-tui '(define (apply2 [f : |Func<int32, int32>|] [x : int]) : int
+                            (.Invoke f x))
+                         '(Console.WriteLine (apply2 (fn ([k : int]) (+ k 1)) 4)))
+                '("5"))
+  (check-regexp-match #rx"parameter s is string but .*Func<int32, int32> takes int32"
+                      (tui-error '(define (sq) : |Func<int32, int32>| (fn ([s : string]) s))))
+  ; overload: an annotated parameter, an unannotated one fixed by the overload, and an
+  ; unannotated one whose body call is overloaded (so the call gives nothing and the overload does)
+  (check-equal? (run-tui `(let ([xs ,(int-list 1 2)])
+                            (.ForEach xs (fn ([x : int]) (Console.WriteLine x)))))
+                '("1" "2"))
+  (check-equal? (run-tui '(let ([names (new |System.Collections.Generic.List<string>|)])
+                            (.Add names "a") (.Add names "") (.Add names "b")
+                            (Console.WriteLine (.RemoveAll names (fn (s) (String.IsNullOrEmpty s))))
+                            (Console.WriteLine (.get_Count names))))
+                '("1" "2"))
+  (check-equal? (run-tui '(let ([names (new |System.Collections.Generic.List<string>|)])
+                            (.Add names "a") (.Add names "b")
+                            (.ForEach names (fn (s) (Console.WriteLine s)))))
+                '("a" "b"))
+  (check-equal? (run-tui '(let ([t (new System.Threading.Thread (fn () (Console.WriteLine "thread")))])
+                            (.Start t)
+                            (.Join t)))
+                '("thread"))
+  ; generic method: the bare fn fixes a type argument, with an annotation or from the receiver
+  (check-equal? (run-tui '(using "System.Core") '(open System.Linq)
+                         `(Console.WriteLine
+                           (Enumerable.Sum (Enumerable.Select ,(int-list 1 2 3) (fn ([x : int]) (* x 2))))))
+                '("12"))
+  (check-equal? (run-tui '(using "System.Core") '(open System.Linq)
+                         '(let ([names (new |System.Collections.Generic.List<string>|)])
+                            (.Add names "a") (.Add names "") (.Add names "b")
+                            (Console.WriteLine
+                             (Enumerable.Count (Enumerable.Where names (fn (s) (String.IsNullOrEmpty s)))))))
+                '("1"))
+  ; body: partial annotation, where the unannotated parameter is fixed by a body call
+  (check-equal? (run-tui '(let ([f (fn ([k : int] s) (String.IsNullOrEmpty s))])
+                            (Console.WriteLine (.Invoke f 3 ""))
+                            (Console.WriteLine (.Invoke f 3 "x"))))
+                '("True" "False"))
+  (check-regexp-match #rx"fn without a delegate type needs"
+                      (tui-error '(let ([f (fn ([k : int] s) k)]) f)))
+  ; zero parameters: the type comes from the overload, the expected type, or the body
+  (check-equal? (run-tui '(let ([fs (new |System.Collections.Generic.List<Func<int32>>|)])
+                            (.Add fs (fn () 5))
+                            (Console.WriteLine (.Invoke (.get_Item fs 0)))))
+                '("5"))
+  (check-equal? (run-tui '(define (run [f : |Func<int32>|]) : int (.Invoke f))
+                         '(Console.WriteLine (run (fn () 7))))
+                '("7")))
+
 (test-case "the REPL lifts lambdas defined in an interaction"
   (define mod (build-path examples "basics.rkt"))
   (dynamic-require mod #f)

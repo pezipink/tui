@@ -286,9 +286,11 @@ Without a delegate name, `fn` takes its type in one of four ways:
   any delegate parameter whose `Invoke` has that arity (`arg-coercion`). After the overload is
   chosen, `finish-args` compiles the `fn` against that parameter type with `tc/expect`. If two
   overloads match, the call is ambiguous and is rejected.
-- **From the body** (Phase A): every parameter is annotated (`(fn ([x : int]) body)`). The body's
-  type picks `Action<...>` when it is `void`, otherwise `Func<..., R>`. The delegate is built with
-  the `Func` or `Action` of those types from `compile-lambda`, so no `|Func<...>|` name is needed.
+- **From the body** (Phase A): each parameter is annotated (`(fn ([x : int]) body)`), or left
+  unannotated for Phase D to fill in. Annotations and Phase D results are combined, and any
+  parameter still without a type is an error. The body's type picks `Action<...>` when it is
+  `void`, otherwise `Func<..., R>`. The delegate is built with the `Func` or `Action` of those
+  types from `compile-lambda`, so no `|Func<...>|` name is needed.
 - **Parameters from a call in the body** (Phase D, `body-param-types`): an unannotated parameter
   that is a direct argument of a call in the body takes that call's parameter type, when the name
   and arity have exactly one closed, non-generic overload. Calls are `Type.Method` and
@@ -422,6 +424,7 @@ and run `raco make main.rkt`.
 | (inline tests) | generic CLR method type arguments through base types | `generic methods bind type arguments through base types` |
 | (inline tests) | bare `fn` argument fixes a method type parameter that only it mentions | `a bare fn argument fixes a method type parameter that only it mentions` |
 | (inline tests) | unannotated `fn` parameter takes the type of the one overload its body fixes | `an unannotated fn parameter takes the type of the one overload a call in its body fixes` |
+| (inline tests) | each source (expected type, overload, generic type argument, body, Phase D) with and without annotations, and mismatches | `each inference source works with and without annotations` |
 | `macros.rkt` | hygienic macros | `Tui macros are hygienic` |
 | `types.rkt` | `default-of`, `type-name-of` | `default-of takes a type name ...`, `type-name-of expands ...` |
 | `lists.rkt` | `list-of`, `sum-of` | `the list-of example runs`, `sum-of reads the element type ...` |

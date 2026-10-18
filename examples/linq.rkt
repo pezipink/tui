@@ -8,7 +8,7 @@
 
 (let ([xs (new |System.Collections.Generic.List<int32>|)]
       ; a lambda stored with let, used as an argument below
-      [even? (fn |Func<int32, bool>| (x) (= (% x 2) 0))])
+      [even? (fn ([x : int]) (= (% x 2) 0))])
   (.Add xs 1) (.Add xs 2) (.Add xs 3) (.Add xs 4) (.Add xs 5) (.Add xs 6)
 
   (let ([evens (Enumerable.Where<int32> xs even?)])
@@ -23,8 +23,8 @@
   ; delegates stored as data in a List, then applied in order by a fold
   (let ([fs (new |System.Collections.Generic.List<Func<int32, int32>>|)])
     (.Add fs square)
-    (.Add fs (fn |Func<int32, int32>| (n) (+ n 1)))
-    (.Add fs (fn |Func<int32, int32>| (n) (* n 10)))
+    (.Add fs (fn (n) (+ n 1)))
+    (.Add fs (fn (n) (* n 10)))
     (let ([i 0] [acc 2])
       (while (< i (.get_Count fs))
         (set! acc (.Invoke (.get_Item fs i) acc))

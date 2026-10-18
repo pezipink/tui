@@ -15,8 +15,8 @@
                                    (tui-type->string t))
                            stx)))
    #'(let ([f1 f] [g1 g])
-       (fn |Func<int32, int32>| (x) (.Invoke f1 (.Invoke g1 x))))])
+       (fn ([x : int]) (.Invoke f1 (.Invoke g1 x))))])
 
 ; square is an identifier macro, so each use expands to a fresh lambda.
 (define-syntax-parser square
-  [_:id #'(fn |Func<int32, int32>| (n) (* n n))])
+  [_:id #'(fn ([n : int]) (* n n))])
