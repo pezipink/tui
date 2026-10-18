@@ -31,7 +31,7 @@ Run from `C:\repos\tui`:
   in PowerShell.
 - Names with commas must use pipes, for example `|Func<int32, int32>|`.
 - Property access is `.get_Count`. `.Count` is rejected.
-- Delegates are called with `.Invoke`. Functions are called directly.
+- Delegate values are called as `(f x)` or `(.Invoke f x)`. Functions are called directly.
 - Type inference only works when a generic parameter is exactly `(mvar n)`. Otherwise write the
   type arguments: `Enumerable.Where<int32>`.
 - A macro that builds `(tui-il ...)` by hand must use `il`, or the type is missing and `tc` reports

@@ -96,6 +96,39 @@
   (check-equal? (length carriers) 1)
   (check-equal? (length (syntax-property (car carriers) 'mouse-over-tooltips)) 27))
 
+(test-case "scopes record each binder with its type and the span where it is visible"
+  (define src
+    "(module m tui
+  (define counter : int 0)
+  (define (f [n : int]) : int (let ([n (+ n 1)]) n))
+  (let ([x 1]) (set! x 2) (Console.WriteLine x)))")
+  (define rcv (make-log-receiver (current-logger) 'info 'tui-scopes))
+  (parameterize ([current-namespace (make-base-namespace)])
+    (expand (read-syntax 'm (open-input-string src))))
+  (define recs (cadr (vector-ref (sync/timeout 5 rcv) 2)))
+  (define (pos rx) (add1 (car (cadr (regexp-match-positions rx src)))))
+  (define (at rx) (add1 (caar (regexp-match-positions rx src))))
+  (define let-form "(let ([n (+ n 1)]) n)")
+  (define let-start (at #rx"\\(let \\(\\[n"))
+  (define body-n-start (+ let-start (string-length "(let ([n (+ n 1)]) ")))
+  (define x-body "(set! x 2) (Console.WriteLine x)")
+  (define x-start (at #rx"\\(set! x"))
+  (check-not-false (member (vector "counter" "int32" (pos #px"\\(define (counter) :") 7 0 +inf.0)
+                           recs))
+  (check-not-false (member (vector "f" "(int32) -> int32" (pos #px"\\(define \\((f) \\[") 1 0 +inf.0)
+                           recs))
+  (check-not-false (member (vector "n" "int32" (pos #px"\\[(n) :") 1
+                                   let-start (+ let-start (string-length let-form)))
+                           recs))
+  (check-not-false (member (vector "n" "int32" (pos #px"\\(\\[(n) \\(\\+") 1
+                                   body-n-start (add1 body-n-start))
+                           recs))
+  (check-not-false (member (vector "x" "int32" (pos #px"\\(\\[(x) 1\\]") 1
+                                   x-start (+ x-start (string-length x-body)))
+                           recs))
+  ; set! assigns an existing binder, so it records no binder of its own.
+  (check-equal? (length (filter (λ (r) (equal? (vector-ref r 0) "x")) recs)) 1))
+
 (test-case "examples run"
   (check-equal? (run-example "basics.rkt")
                 '("3628800" "832040" "KIA ORA!" "1.4142135623731" "5"))
@@ -265,6 +298,16 @@
             '(Console.WriteLine (.ToString #\z)))
    '("3.5" "-10" "2" "abc" "True" "True" "True" "5000000000" "z")))
 
+(test-case "a numeric literal can be the receiver of a member call"
+  (check-equal?
+   (run-tui '(Console.WriteLine (1.ToString))
+            '(Console.WriteLine (1.5.ToString))
+            '(Console.WriteLine (5000000000.ToString)))
+   '("1" "1.5" "5000000000")))
+
+(test-case "a member missing on a numeric literal is a compile error"
+  (check-not-false (tui-error '(Console.WriteLine (1.NoSuchMember)))))
+
 (test-case "null is typed from the expected type and works as an argument"
   (check-equal?
    (run-tui '(define (empty? [s : string]) : bool (null? s))
@@ -360,6 +403,34 @@
                             (set! k 5)
                             (Console.WriteLine (.Invoke (fn Func<int32> () k)))))
                 '("6" "5")))
+
+(test-case "a delegate value is called as (f x), as well as with .Invoke"
+  (check-equal? (run-tui '(let ([sq (fn ([n : int]) (* n n))])
+                            (Console.WriteLine (sq 9))
+                            (Console.WriteLine (.Invoke sq 3))))
+                '("81" "9"))
+  (check-equal? (run-tui '(define (sq) : |Func<int32, int32>| (fn (n) (* n n)))
+                         '(define (apply-fn [f : |Func<int32, int32>|] [x : int]) : int (f x))
+                         '(Console.WriteLine (apply-fn (sq) 4)))
+                '("16"))
+  (check-equal? (run-tui '(let ([five (fn () 5)])
+                            (Console.WriteLine (five))))
+                '("5"))
+  (check-equal? (run-tui '(let ([k 3])
+                            (let ([add (fn ([a : int]) (+ a k))])
+                              (Console.WriteLine (add 4))
+                              (set! k 10)
+                              (Console.WriteLine (add 4)))))
+                '("7" "14"))
+  (check-equal? (run-tui '(let ([sq (fn ([n : int]) (* n n))])
+                            (let ([f (fn (x) (sq x))])
+                              (Console.WriteLine (.Invoke f 6)))))
+                '("36"))
+  (check-equal? (run-tui '(define g : |Func<int32, int32>| (fn (n) (* n 2)))
+                         '(Console.WriteLine (g 5)))
+                '("10"))
+  (check-regexp-match #rx"n is int32, not a delegate, so it cannot be called"
+                      (tui-error '(let ([n 1]) (n 2)))))
 
 (test-case "fn without a delegate name takes the expected delegate type"
   (check-equal? (run-tui '(define (sq) : |Func<int32, int32>| (fn (n) (* n n)))
@@ -586,9 +657,52 @@
                 '("11" "9" "True" "False" "True" "False" "4" "Equals" "55")))
 
 (test-case "threading's ~> and ~>> compile to ordinary Tui calls"
-  (check-equal? (run-example "threading.rkt") '("14" "5" "11" "TUI" "pipe"))
+  (check-equal? (run-example "threading.rkt") '("14" "5" "11" "TUI" "pipe" "3"))
   (check-regexp-match #rx"unbound function"
                      (tui-error '(require threading) '(Console.WriteLine (as~> 3 x (+ x 1))))))
+
+(test-case "a.b on a local calls or reads a member of that local, even when a type has the same name"
+  (check-equal? (run-tui '(define (h [s : string]) : int s.Length)
+                         '(define (k [Console : string]) : int Console.Length)
+                         '(define (g [s : string]) : int (.Length s))
+                         '(define (sub [s : string]) : string (s.Substring 1))
+                         '(Console.WriteLine (h "four"))
+                         '(Console.WriteLine (k "abcd"))
+                         '(Console.WriteLine (g "hello"))
+                         '(Console.WriteLine (sub "abc")))
+                '("4" "4" "5" "bc"))
+  (check-equal? (run-tui '(Console.WriteLine (null? Console.Out))) '("False")))
+
+(test-case "threaded member chains read properties, call methods and fall back to getters"
+  (check-equal? (run-tui '(require threading)
+                         '(define (h [s : string]) : int s.Length)
+                         '(Console.WriteLine (~> "tui" .Length))
+                         '(Console.WriteLine (~> 5 .ToString .Length))
+                         '(Console.WriteLine (~> "  tui  " (.Trim) .Length))
+                         '(Console.WriteLine (h (~> "ab" (.PadRight 5))))
+                         '(let ([n (~> "four" .Length)]) (Console.WriteLine n)))
+                '("3" "1" "3" "5" "4")))
+
+(test-case "a member that does not exist is named in the error"
+  (check-regexp-match #rx"has no public instance method or property Nope"
+                      (tui-error '(define (f [s : string]) : int s.Nope)))
+  (check-regexp-match #rx"has no public instance method or property Nope"
+                      (tui-error '(define (f [s : string]) : int (.Nope s))))
+  (check-regexp-match #rx"has no public instance method Nope"
+                      (tui-error '(define (f [s : string]) : int (s.Nope 1))))
+  (check-regexp-match #rx"Console has no public static method or property Nope"
+                      (tui-error '(define (f) : int Console.Nope))))
+
+(test-case "hover marks dotted members and the steps of a threaded chain"
+  (define tips
+    (expanded-tooltips
+     "(module m tui (require threading) (define (h [s : string]) : int s.Length)
+  (define (k) : int (~> Console.Out .ToString .Length)))"))
+  (check-not-false (member '("s.Length" "int32") tips))
+  (check-not-false (member '("s" "string") tips))
+  (check-not-false (member '("Console.Out" "System.IO.TextWriter") tips))
+  ; A threaded step is a compound expression, so it is marked on its first and last characters.
+  (check-not-false (member '("." "string") tips)))
 
 (test-case "phase 1 definitions: syntax classes, simple macros and phase-1 helpers"
   (check-equal? (run-example "syntax-classes.rkt") '("42" "10" "29"))

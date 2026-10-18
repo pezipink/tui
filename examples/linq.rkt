@@ -25,7 +25,7 @@
     (.Add fs square)
     (.Add fs (fn (n) (+ n 1)))
     (.Add fs (fn (n) (* n 10)))
-    (let ([i 0] [acc 2])
+    (let ([i 0 ] [acc 2])
       (while (< i (.get_Count fs))
         (set! acc (.Invoke (.get_Item fs i) acc))
         (set! i (+ i 1)))

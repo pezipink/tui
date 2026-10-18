@@ -10,3 +10,4 @@
 (Console.WriteLine (~> 5 double (+ 1)))                 ; double 5 + 1 = 11
 (Console.WriteLine (~> "  tui  " (.Trim) (.ToUpper)))   ; TUI
 (Console.WriteLine (~> "pipeline" (.Substring 0 4)))    ; pipe
+(Console.WriteLine (~> "  tui  " (.Trim) .Length))      ; the trimmed "tui" has length 3

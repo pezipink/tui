@@ -25,7 +25,10 @@ section 11 for the exact IL forms.
 | `main.rkt` | The language: every Tui form, the type checker `tc`, function and lambda compilation, module and REPL expansion, phase-1 helpers and syntax classes. |
 | `private/clr.rkt` | The CLR bridge: reference configuration, type datums, metadata lookup, `coercion`, overload and generic-method resolution. |
 | `private/runtime.rkt` | Program assembly: `make-tui-program`, `tui-program->il`, `tui-write-exe`, `run-tui-program`. |
+| `private/meta-server.rkt` | The editor helper: JSON lines on stdio for scopes, names, types and members. See section 4. |
 | `tests/tui-test.rkt` | The test suite (29 tests, about 4 minutes). |
+| `tests/meta-server-test.rkt` | Tests for the editor helper's requests, in process. |
+| `editors/vscode-tui/` | The VS Code companion: completion and Browse Members, through the helper. See section 4. |
 | `examples/` | Runnable programs. Each one is covered by a test. See section 12. |
 | `docs/captures.md` | The design notes for closure captures. |
 
@@ -94,6 +97,11 @@ source file and by the expression's `(position . span)`, and keeps the first ent
 Expressions with no source or no span are skipped. The table is per file, so a required module
 does not disturb the module being expanded.
 
+Binding positions and call arguments are recorded too: `compile-body` records each bound name
+(function parameters and locals), `tui-let` records each `let` name, `tui-set!` records the target of
+a `set!`, and `tc-args` records each argument leaf. `tc` and `tc-args` take the original syntax as an origin, since
+`local-expand` before `tc` produces syntax with no source that would be dropped.
+
 `tooltip-leaves` turns each entry into leaves `(vector stx start end text)`, following Typed
 Racket's placement. A compound expression is marked on its parens only, so an inner expression's
 leaf does not overlap its outer one. An atom is marked over its whole text. Positions are 0-based
@@ -109,6 +117,60 @@ expansion. It logs the leaves on `online-check-syntax` as a carrier syntax objec
 `'mouse-over-tooltips` property. racket-langserver reads that log as hover text, and the carrier
 stays in the expansion so Check Syntax can read the same property. The log message is prefixed
 with the topic, and its suffix routes it to the hover path, not Typed Racket's.
+
+### Scope table and the metadata helper
+
+Completion needs the binders visible at a position. Parameters (`compile-body`, `compile-function`),
+`let` names (`tui-let`) and module-level `define`s call `record-scope!`. Each record is
+`(vector name type-text position span start end)`, where `start` and `end` bound the part of the
+file the binder is visible in (`end` is exclusive, and module-level binders run to `+inf.0`). The
+first record for a binder position wins, as with hover.
+
+Macro-time tables live in the phase-1 instance of `main.rkt`, which a separate process cannot read.
+So `%tui-scopes` logs `(list src records references opens)` on the `tui-scopes` topic of the
+`info` level after each expansion, and the references and opens are included so the helper can
+configure the metadata it answers with.
+
+[meta-server.rkt](/c:/repos/tui/private/meta-server.rkt) is a long-lived process that speaks JSON
+lines on stdio. It expands each `scopes` request's text (`#lang` is skipped, and the forms keep
+their positions) in one namespace, and keeps the scopes of the last good expansion for each file.
+Relative requires such as `(require "fnlib.rkt")` resolve against the file's directory, not the
+helper's working directory, so the file's own path must be sent.
+A failed expansion replies `ok: false` with `kept` and leaves the snapshot alone. Requests: 
+
+- `names` (`offset`): the visible values and functions at a 0-based offset, innermost first.
+- `types`: the public types of the references, with the namespace and whether it is opened.
+- `members` (`offset`, `receiver`): the members of a visible value, the instance members of a numeric literal such as `1` or `1.5`, or the static members of a type name.
+  Both include the members inherited from base classes, and Object's members for interfaces. A method
+  hides an inherited one with the same name and parameter types.
+  Getters with no parameters are properties. Other methods are listed with their overloads.
+
+The offset is a character offset. VS Code counts UTF-16 units, so the two agree only for text
+outside the astral planes.
+
+#### The VS Code companion
+
+[editors/vscode-tui](/c:/repos/tui/editors/vscode-tui) is a VS Code extension that runs the helper
+(`racket private/meta-server.rkt`, found from the `tui.metaServerPath` setting or the workspace).
+It is plain JavaScript with no build step, so it runs in VS Code's own Node without an install.
+The plan called for TypeScript; this was chosen because the repository has no Node toolchain.
+
+- `lib/syntax.js` decides whether a document is a Tui module (its first line is `#lang tui`) and
+  finds a dotted receiver before the cursor, such as `names.Co`. These are pure functions.
+- `lib/metaClient.js` runs one helper process and matches replies to requests by `id`. Requests time
+  out after 20 seconds. A helper that exits fails the requests it owed.
+- `lib/service.js` sends `scopes` only when a document's version changes, so names, types and
+  members share one expansion. Types are cached per version.
+- `lib/completion.js` answers the completion provider. In a member position it offers the receiver's
+  members, with the typed prefix as the range. Each method overload is its own item, with its
+  parameter types in the label, so they are visible without focusing each one. Elsewhere it offers
+  the visible values and the opened arity-0 types, ranked ahead of racket-langserver's name-only list.
+- `lib/browse.js` is the `Tui: Browse Members` command. It asks for a value or type, then a member,
+  and inserts the member in the dotted form the compiler reads.
+
+`extension.js` wires these up. The tests in `editors/vscode-tui/test` run under VS Code's
+Electron in Node mode, with a stand-in `vscode` module and the real helper. The extension host
+itself is not exercised.
 
 ## 5. Type representation
 
@@ -169,6 +231,34 @@ A call to a .NET method (`compile-static-call`, `compile-instance-call`, `tui-ne
    with `tc/expect`. If a type argument is still open, the bare `fn`s fix it first (`compile-partial-fn`),
    then the arguments are converted. A null fixes no type argument, so it is compiled after the method
    is closed. An argument whose type is still open is an error.
+
+### Member access syntax
+
+Four forms reach the same CLR call code:
+
+- `(.Method recv args ...)`: an instance call. `recv` is any expression.
+- `(Type.Method args ...)`: a static call. `Type` is a type name, possibly dotted, such as `System.Console`.
+- `(a.Method args ...)`: an instance call on `a`, when `a` is a local or parameter. The receiver is
+  `a`. A local shadows a type of the same name, so with a local `Console`, `Console.Length` reads the
+  local. `a` must be a single segment. A numeric literal can also be `a`: `1.ToString` and
+  `1.5.ToString` are instance calls on an `int32`, `int64` or `float64` literal (`5000000000` is
+  `int64`). The reader keeps `1.ToString` as one symbol, so the compiler splits it at the last dot
+  and types the literal from its text. Strings, chars and booleans have no dotted form. Use the
+  prefix form `(.Length "x")` or a threaded step `(~> "x" (.Length))`.
+- bare `a.Name` and `Type.Name`, with no parentheses: a member read with no arguments. These expand
+  to a zero-argument call through `tui-top`, which hands them to `tui-app`.
+
+A member read, with or without arguments, uses a method `Name` when one exists, and the usual overload
+rules then apply. Otherwise, when there are no arguments, it falls back to the property getter
+`get_Name`. So `s.Length` reads the `Length` property of a string, and `xs.Count` reads `get_Count`.
+
+Threading works with the same forms. A bare clause `.Name` in `~>` or `~>>` becomes `(.Name prev)`,
+so `(~> "tui" .Length)` is a property read on the threaded value. A value type in the chain is boxed,
+as in any instance call.
+
+Hover: `a.Name` is marked as one expression, and its receiver `a` has its own leaf. A threaded step is
+a compound expression, so it is marked on its first and last characters only, as for any form in the
+hover model. The middle of a threaded step's name has no tooltip.
 
 ### Fixing type arguments (`infer-targs`)
 
@@ -329,7 +419,8 @@ Without a delegate name, `fn` takes its type in one of four ways:
 - **Parameters from a call in the body** (Phase D, `body-param-types`): an unannotated parameter
   that is a direct argument of a call in the body takes that call's parameter type, when the name
   and arity have exactly one closed, non-generic overload. Calls are `Type.Method` and
-  `.Method recv` with a variable receiver. The scan skips nested binders, so it does not look
+  `.Method recv` with a variable receiver, and `(f x)` for a delegate local or module value, whose
+  parameters come from its `Invoke` method. The scan skips nested binders, so it does not look
   inside `fn`, `let`, `let*`, `letrec` or `define`. Example: `(fn (s) (String.IsNullOrEmpty s))`.
   Overloaded methods such as `Console.WriteLine` give no inference, so the parameter must be
   annotated.
@@ -339,10 +430,10 @@ Without a delegate name, `fn` takes its type in one of four ways:
   the delegate's already-known types, and its body type fixes the rest. Section 6 describes the rule
   and its limits.
 
-A lambda is a value. It can be stored with `let`, passed as an argument, returned, and invoked with
-`.Invoke`. A delegate is called with `.Invoke`, as in `(.Invoke f x)`. Writing `(f x)` for a delegate `f` is an
-error. Functions are called directly, which emits `call` on `Program`. A module value applied as
-`(g x)` is rejected with `module values are not first-class in Tui; use the name`.
+A lambda is a value. It can be stored with `let`, passed as an argument, returned, and called. A
+delegate value `f`, whether a local, an argument or a module value, is called as `(f x)` or as
+`(.Invoke f x)`, and both compile to the same call. Calling a name that is not a delegate is an error.
+Functions are called directly, which emits `call` on `Program`.
 
 Captures are shared, not copied. Each run of a `let` makes new variables. See
 [captures.md](captures.md) for cells, env fields, and invariants.
@@ -448,10 +539,16 @@ Common messages (the exact wording is in `main.rkt` and `private/clr.rkt`):
 The REPL tests evaluate `(#%top-interaction . form)` in the module's namespace.
 
 The hover tests expand a module read from a string (`expanded-tooltips`). They check the exact
-(text, type) leaves and that the same carrier is logged on `online-check-syntax`.
+(text, type) leaves, that binders (`let`, `set!`, `fn` parameters) and call arguments are marked,
+and that the same carrier is logged on `online-check-syntax`. Generic types appear escaped
+(`\<int32\>`) in the leaf text, which is what the tests expect.
 
 Run the suite with `raco test tests\tui-test.rkt`. It takes about 4 minutes. Run `raco make
 main.rkt` first if you have changed `main.rkt` or `private/*.rkt`.
+
+`tests/meta-server-test.rkt` tests `handle-request` in process: the scope table (shadowing and
+function records), member listing for a generic value and for a type, the public types of the
+references, and the last-good snapshot after a failed expansion. It runs in a few seconds.
 
 Stale compiled files cause struct mismatches. If you see one, delete the `compiled` directories
 and run `raco make main.rkt`.
@@ -479,12 +576,18 @@ and run `raco make main.rkt`.
 | `fnlib.rkt` | `compose` and `square` library macros | `compose checks that both arguments are Func<int32, int32>` |
 | `phase1.rkt` | metadata helpers at expansion time | `phase 1 macros read overloads, supertypes and members from metadata` |
 | `syntax-classes.rkt` | syntax classes, `define-simple-macro`, phase-1 helpers | `phase 1 definitions: syntax classes, simple macros and phase-1 helpers` |
-| `threading.rkt` | `threading`'s `~>` and `~>>` | `threading's ~> and ~>> compile to ordinary Tui calls` |
+| `threading.rkt` | `threading`'s `~>` and `~>>` | `threading's ~> and ~>> compile to ordinary Tui calls, and a bare .Name clause reads a member` |
 | `values.rkt` | module values, `set!`, initialization order | `module values are static fields set in source order, and set! updates them` |
 
 ## 17. Known limits
 
 - Hover tooltips for two expressions with the same position and span show the first one recorded. A macro that copies a form without moving it can therefore hide the type of the copy.
+- Hover text is escaped for racket-langserver's Markdown rendering, so DrRacket's Check Syntax shows `\<` and `\>` for generic types. This is accepted as is.
+- Hover is checked through racket-langserver only, not in the DrRacket GUI.
+- Hover and the scope table are not built for half-typed buffers. A failed expansion leaves the last good table in place, and the metadata helper answers from it. Completion at the cursor can therefore be a few edits out of date.
+- The metadata helper's offsets are character offsets. Editors that count UTF-16 units (VS Code) disagree with them after an astral-plane character.
+- The VS Code companion cannot browse generic types, since their type arguments are not known. They are reached through a value of the type. Member completion inserts names only, not argument lists.
+- The metadata helper keeps a snapshot for every file it has been sent and has no close request, so it holds on to closed files until it exits.
 - Inference is limited to exact `(mvar n)` parameters, base-type matches of generic instance
   parameters, and the bare `fn` body rule. There is no unification.
 - A parameter type inferred from a body call (Phase D) needs one overload with that name and arity.
@@ -492,8 +595,9 @@ and run `raco make main.rkt`.
 - A bare `fn` cannot fix a type argument that appears only as a whole parameter `!!n`, and a
   delegate class argument that is an unbound `!!n` cannot be inferred.
 - A read of a later module value through a function call from an initializer is not caught.
-- A delegate cannot be called as `(f x)`. Use `.Invoke`.
-- `.Count` is rejected; write `get_Count` or use the property getter form.
+- Member reads are one dot deep. `x.Name` and `Type.Name` work bare, but `a.b.c` is an unbound
+  identifier. Write `(~> a .b .c)` instead. Dotted heads inside a threaded clause, such as
+  `(~> x (xs.Thing))`, are not supported and have no tests; use the bare `.Thing` clause form.
 - Error display crashes with `fprintf: ill-formed pattern string` when a message contains `~`, for
   example an 8.3 temporary path. This is a pre-existing bug and is not fixed here.
 - Captured cells use one array per variable. Grouping captures into one object would reduce

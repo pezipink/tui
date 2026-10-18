@@ -39,7 +39,7 @@ For `(fn Func<int32,int32> (n) body)` with captured variables `k1..kN` (in captu
   cell does `dup; ldloc cell_k; stfld closureN capK (szarray T)`. It then does
   `ldftn R closureN::Invoke (P...)` and `newobj Delegate::.ctor(object, native int)`. The delegate
   target is the new object. This is an ordinary, first-class delegate object. It can be stored,
-  passed, returned and invoked with `.Invoke`.
+  passed, returned and called as `(f x)` or `(.Invoke f x)`.
 - Inside `Invoke`, each field is copied into a local with `ldarg.0; ldfld closureN capK (szarray T);
   stloc`. The body then reads the cell from that local like any other cell.
 - Shared state is the cell array itself, not the field. The field holds a reference to the same

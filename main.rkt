@@ -162,6 +162,30 @@
                 [leaf (in-list (tooltip-leaves (car entry) (cdr entry)))])
       leaf))
 
+  ; Scopes for completion. Each binder (a parameter, a let name, or a module-level define or value)
+  ; is recorded with its type and the span where it is visible, and the module's end logs them on
+  ; the tui-scopes topic for the completion helper. Positions are 1-based, as in syntax. A module
+  ; binder is visible everywhere, so its span is 0 to +inf.0.
+  (define-logger tui-scopes)
+  (define scope-records (make-hash))
+
+  (define (record-scope! id text start end)
+    (define src (syntax-source id))
+    (when (and src start (syntax-position id) (> (syntax-span id) 0))
+      (define tbl (hash-ref! scope-records src make-hash))
+      (unless (hash-ref tbl (syntax-position id) #f)
+        (hash-set! tbl (syntax-position id)
+                   (vector (symbol->string (syntax-e id)) text
+                           (syntax-position id) (syntax-span id) start end)))))
+
+  ; The span of a list of forms, as (values start end), or (values #f #f) when none has a position.
+  (define (forms-span forms)
+    (define ps (filter (λ (f) (and (syntax-position f) (> (syntax-span f) 0))) forms))
+    (if (null? ps)
+        (values #f #f)
+        (values (apply min (map syntax-position ps))
+                (apply max (map (λ (f) (+ (syntax-position f) (syntax-span f))) ps)))))
+
   ; Expands stx to a typed fragment: (values type instructions). origin is the source syntax
   ; that the type is recorded for, when stx is already expanded and has lost its location.
   (define (tc stx [ctx #f] [origin stx])
@@ -193,12 +217,24 @@
   ; a lambda body (its own method) cannot reach the enclosing method's slots.
   ; kind is 'arg, 'local (a plain slot of owner's method) or 'cell (index is the local of owner
   ; that holds the cell array; the variable's value is element 0).
+  ; (f arg ...) on a delegate value f is the same call as (.Invoke f arg ...). The rewritten form
+  ; is expanded again, so the argument checks and the Invoke call are those of .Invoke.
+  (define (delegate-call stx ty)
+    (syntax-parse stx
+      [(f:id arg ...)
+       (unless (delegate-type? ty)
+         (raise-syntax-error 'tui (format "~a is ~a, not a delegate, so it cannot be called"
+                                          (syntax-e #'f) (tui-type->string ty))
+                             stx))
+       (quasisyntax/loc stx (tui-app .Invoke f arg ...))]
+      [_ (raise-syntax-error 'tui "a delegate call needs a name, as in (f arg ...)" stx)]))
+
   (struct tui-var (kind index type owner ord)
     #:property prop:procedure
     (λ (self stx)
       (cond
-        [(not (identifier? stx)) (raise-syntax-error 'tui "a variable cannot be called" stx)]
-        [else (il (tui-var-type self) (load-var self stx))])))
+        [(identifier? stx) (il (tui-var-type self) (load-var self stx))]
+        [else (delegate-call stx (tui-var-type self))])))
 
   (define (make-tui-var kind index type ord) (tui-var kind index type (current-mctx) ord))
 
@@ -416,11 +452,12 @@
   (struct tui-global (name type)
     #:property prop:procedure
     (λ (self stx)
-      (unless (identifier? stx)
-        (raise-syntax-error 'tui "module values are not first-class in Tui; use the name" stx))
-      (check-global-scope self stx)
-      (il (global-type self) (list `(ldsfld Program ,(tui-global-name self)
-                                            ,(tui-type->il (global-type self)))))))
+      (cond
+        [(identifier? stx)
+         (check-global-scope self stx)
+         (il (global-type self) (list `(ldsfld Program ,(tui-global-name self)
+                                               ,(tui-type->il (global-type self)))))]
+        [else (delegate-call stx (global-type self))])))
 
   (define (make-tui-global name type) (tui-global name type))
 
@@ -463,6 +500,7 @@
   (define (compile-body stx binds body rty parent owner)
     (define m (new-mctx parent))
     (parameterize ([current-mctx m])
+      (define-values (body-start body-end) (forms-span body))
       ; A captured argument is copied into a cell, so the lambda and its enclosing method share it.
       (define-values (cell-binds arg-code)
         (for/fold ([bs '()] [code '()] #:result (values (reverse bs) (append* (reverse code))))
@@ -473,6 +511,7 @@
           (define ty (cadddr b))
           (define ord (next-ordinal!))
           (record-tooltip! id ty)
+          (record-scope! id (tui-type->string ty) body-start body-end)
           (cond
             [(and (eq? kind 'arg) (cell-ordinal? ord))
              (define j (alloc-local-in! m (cell-of ty)))
@@ -516,6 +555,10 @@
     (define-values (name pnames ptypes ret body) (fun-header def))
     (define ptys (map ann->type ptypes))
     (define rty (ann->type ret))
+    (record-scope! name
+                   (format "(~a) -> ~a" (string-join (map tui-type->string ptys) ", ")
+                           (tui-type->string rty))
+                   0 +inf.0)
     (define-values (code m _rty)
       (run-passes
        (λ ()
@@ -533,6 +576,7 @@
     (syntax-parse def
       [(_ name:id (~datum :) t:id e)
        (define rty (ann->type #'t))
+       (record-scope! #'name (tui-type->string rty) 0 +inf.0)
        (define-values (code m _rty)
          (run-passes
           (λ ()
@@ -598,11 +642,21 @@
                    (define rest (cdr args))
                    (cons (arity-overloads (find-instance-methods owner (cadr m)) (length rest))
                          rest)]))]
+          [(and (dotted-match name) (local-receiver head name))
+           => (λ (v)
+                (define m (dotted-match name))
+                (define t (tui-var-type v))
+                (define owner (if (value-type? t) 'object t))
+                (cons (arity-overloads (find-instance-methods owner (caddr m)) (length args))
+                      args))]
           [(regexp-match #rx"^(.+)\\.([^.]+)$" name)
            => (λ (m)
                 (cons (arity-overloads (list (find-static-methods (cadr m) (caddr m)))
                                        (length args))
                       args))]
+          [(delegate-value-type head)
+           => (λ (t)
+                (cons (arity-overloads (find-instance-methods t "Invoke") (length args)) args))]
           [else (cons '() '())])))
     (define (note-call! head args)
       (define c (call-candidates head args))
@@ -850,6 +904,7 @@
      (tui-configure! refs opens)
      (set-box! lifted-classes '())
      (hash-remove! tooltip-tables (syntax-source stx))
+     (hash-remove! scope-records (syntax-source stx))
      (define defs (of 'define))
      (define vals (of 'value))
      (define val-names (for/list ([v vals]) (list-ref (syntax->list v) 1)))
@@ -885,11 +940,24 @@
                                (tui-main (vinit ...) stmt ...))))
           ; after prog, so every method and expression of the module has been recorded
           (define %tui-tooltips (tui-tooltips #,(datum->syntax #f (syntax-source stx))))
+          (define %tui-scopes (tui-scopes #,(datum->syntax #f (syntax-source stx))))
           (provide (rename-out [prog tui-program]))
           (module+ main (run-tui-program prog))))]))
 
 (define-syntax (tui-reference-list stx)
   #`(quote #,(tui-references)))
+
+; The scope records of the module are logged on the tui-scopes topic. The data is (source records
+; references opens), where each record is (vector name type-text position span start end). Positions
+; are 1-based. The references and opens are those the module was configured with, so a helper
+; process can answer member queries for the same environment.
+(define-syntax (tui-scopes stx)
+  (syntax-case stx ()
+    [(_ src)
+     (let* ([recs (hash-ref scope-records (syntax-e #'src) make-hash)]
+            [data (list (syntax-e #'src) (hash-values recs) (tui-references) (tui-opens))])
+       (log-message tui-scopes-logger 'info 'tui-scopes "Tui scopes" data)
+       #''#f)]))
 
 ; Logs the module's tooltips on online-check-syntax for racket-langserver, and keeps them in the
 ; expansion for Check Syntax. The carrier's 'mouse-over-tooltips property holds the leaves.
@@ -992,7 +1060,11 @@
 
 (define-tui-form (tui-top stx)
   (syntax-parse stx
-    [(_ . id) (raise-syntax-error 'tui "unbound identifier" #'id)]))
+    [(_ . id)
+     ; A bare a.b reads a local's property (xs.Count) or a static property (Console.Out).
+     (if (dotted-match (symbol->string (syntax-e #'id)))
+         #'(tui-app id)
+         (raise-syntax-error 'tui "unbound identifier" #'id))]))
 
 ; A bare null takes its type from the expected type (set by tc/expect), which must be a reference
 ; type. Its code is the same whatever the type is.
@@ -1037,6 +1109,17 @@
      (cond
        [(regexp-match #rx"^\\.([^.]+)$" name)
         => (λ (m) (compile-instance-call stx #'head (cadr m) args explicit))]
+       [(and (dotted-match name) (local-receiver #'head name))
+        => (λ (_)
+             (define m (dotted-match name))
+             (compile-instance-call stx #'head (caddr m)
+                                    (cons (segment-syntax #'head (cadr m)) args) explicit))]
+       [(regexp-match #rx"^([0-9]+(?:\\.[0-9]+)?)\\.([^.]+)$" name)
+        => (λ (m)
+             (compile-instance-call stx #'head (caddr m)
+                                    (cons (literal-syntax #'head (string->number (cadr m)) (cadr m))
+                                          args)
+                                    explicit))]
        [(regexp-match #rx"^(.+)\\.([^.]+)$" name)
         => (λ (m) (compile-static-call stx #'head (cadr m) (caddr m) args explicit))]
        [else (raise-syntax-error 'tui "unbound function" #'head)])]
@@ -1052,12 +1135,48 @@
          (or (with-clr head (λ () (string->tui-type s)))
              (raise-syntax-error 'tui (format "unknown type argument ~a" s) head))])))
 
+  ; A head or identifier a.b: the match, or #f. a and b are non-empty and contain no dots.
+  (define (dotted-match name)
+    (regexp-match #rx"^([^.]+)\\.([^.]+)$" name))
+
+  ; An identifier for the part a of a.b, with the head's context and a span of just that part.
+  (define (segment-syntax head text)
+    (datum->syntax head (string->symbol text)
+                   (list (syntax-source head) (syntax-line head) (syntax-column head)
+                         (syntax-position head) (string-length text))))
+
+  ; The delegate type of head when it names a local or a module value of delegate type, or #f.
+  ; A call (f x) on such a name is a call of its Invoke method.
+  (define (delegate-value-type head)
+    (define v (and (identifier? head) (syntax-local-value head (λ () #f))))
+    (define t (cond [(tui-var? v) (tui-var-type v)]
+                    [(tui-global? v) (global-type v)]
+                    [else #f]))
+    (and t (delegate-type? t) t))
+
+  ; A literal receiver with the span of its text, so errors point at it.
+  (define (literal-syntax head value text)
+    (datum->syntax head value
+                   (list (syntax-source head) (syntax-line head) (syntax-column head)
+                         (syntax-position head) (string-length text))))
+
+  ; The local or parameter (a tui-var) that a in a.b names, or #f. A local shadows a type.
+  (define (local-receiver head name)
+    (define m (dotted-match name))
+    (define v (and m (syntax-local-value (segment-syntax head (cadr m)) (λ () #f))))
+    (and (tui-var? v) v))
+
+  ; A bare name with no arguments reads a property when there is no method of that name.
   (define (compile-static-call stx head type-name method-name args explicit)
     (define-values (tys codes) (tc-args args))
-    (define ms (with-clr head (λ () (find-static-methods type-name method-name))))
-    (unless ms (raise-syntax-error 'tui (format "unknown type ~a" type-name) head))
+    (define (lookup name) (with-clr head (λ () (find-static-methods type-name name))))
+    (define ms0 (lookup method-name))
+    (unless ms0 (raise-syntax-error 'tui (format "unknown type ~a" type-name) head))
+    (define property? (null? args))
+    (define ms (if (and property? (null? ms0)) (lookup (string-append "get_" method-name)) ms0))
     (when (null? ms)
-      (raise-syntax-error 'tui (format "~a has no public static method ~a" type-name method-name)
+      (raise-syntax-error 'tui (format "~a has no public static ~a ~a" type-name
+                                       (if property? "method or property" "method") method-name)
                           head))
     (define-values (m convs)
       (with-clr stx (λ () (resolve-overload (list ms) tys
@@ -1076,10 +1195,14 @@
         [(value-type? rty) (values 'object (append rcode `((box ,(tui-type->il rty)))))]
         [(eq? rty 'void) (raise-syntax-error 'tui "receiver has type void" (car args))]
         [else (values rty rcode)]))
-    (define groups (with-clr head (λ () (find-instance-methods owner method-name))))
+    (define (lookup name) (with-clr head (λ () (find-instance-methods owner name))))
+    (define property? (null? (cdr args)))
+    (define groups0 (lookup method-name))
+    (define groups (if (and property? (null? groups0)) (lookup (string-append "get_" method-name)) groups0))
     (when (null? groups)
-      (raise-syntax-error 'tui (format "~a has no public instance method ~a"
-                                       (tui-type->string owner) method-name)
+      (raise-syntax-error 'tui (format "~a has no public instance ~a ~a"
+                                       (tui-type->string owner)
+                                       (if property? "method or property" "method") method-name)
                           head))
     (define-values (m convs)
       (with-clr stx (λ () (resolve-overload groups tys
@@ -1155,6 +1278,8 @@
        (when (eq? ty 'void) (raise-syntax-error 'tui "cannot bind a void value" e)))
      (define xs (syntax->list #'(x ...)))
      (for ([x (in-list xs)] [t (in-list tys)]) (record-tooltip! x t))
+     (let-values ([(start end) (forms-span (syntax->list #'(body ...)))])
+       (for ([x (in-list xs)] [t (in-list tys)]) (record-scope! x (tui-type->string t) start end)))
      (define ords (for/list ([x (in-list xs)]) (next-ordinal!)))
      (define cells? (for/list ([ord (in-list ords)]) (cell-ordinal? ord)))
      (define slots (for/list ([ty tys] [c? cells?]) (alloc-local! stx (if c? (cell-of ty) ty))))

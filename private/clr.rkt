@@ -10,7 +10,7 @@
          (only-in rangi/src/types/provider make-env make-declaration-provider prefer-local-policy
                   first-match-policy env-type [resolve-type-name find-type-name]))
 (provide reference-assemblies-dir mscorlib-path
-         tui-configure! tui-add-reference! tui-add-open! tui-references
+         tui-configure! tui-add-reference! tui-add-open! tui-references tui-opens
          resolve-type-name generic-instance string->tui-type split-type-args class-of tui-type->il
          tui-type->string value-type? numeric-type? coercion
          (struct-out clr-method) find-static-methods find-instance-methods find-constructors
@@ -48,6 +48,7 @@
     (set! current-env #f)))
 
 (define (tui-references) references)
+(define (tui-opens) opens)
 
 ; "System.Xml" names a framework reference assembly; anything with a slash or .dll is a path.
 (define (normalize-reference r)
