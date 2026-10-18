@@ -15,7 +15,7 @@
          resolve-type-name generic-instance string->tui-type split-type-args class-of tui-type->il
          tui-type->string value-type? numeric-type? coercion
          (struct-out clr-method) find-static-methods find-instance-methods find-constructors
-         resolve-overload owner->il base-type)
+         resolve-overload owner->il base-type supertypes type-methods)
 
 (define reference-assemblies-dir
   "C:/Program Files (x86)/Reference Assemblies/Microsoft/Framework/.NETFramework/v4.7.1/")
@@ -221,11 +221,39 @@
 (define (coercion from to)
   (cond
     [(equal? from to) '(0)]
-    [(and (eq? to 'object) (not (value-type? from)) (not (eq? from 'void))) '(1)]
+    ; object costs more than a base class or interface, so List<T> prefers IEnumerable<T> to object
+    [(and (eq? to 'object) (not (value-type? from)) (not (eq? from 'void))) '(2)]
     [(and (eq? to 'object) (value-type? from)) `(2 (box ,(tui-type->il from)))]
     [(and (eq? from 'int32) (eq? to 'int64)) '(1 (conv.i8))]
     [(and (memq from '(int32 int64)) (eq? to 'float64)) '(1 (conv.r8))]
+    [(reference-upcast? from to) '(1)]
     [else #f]))
+
+; An implicit reference conversion: a class (or string) to one of its base classes or interfaces,
+; with the type arguments those supertypes have in the closed class. The IL needs no instruction.
+(define (reference-upcast? from to)
+  (and (pair? to)
+       (or (pair? from) (eq? from 'string))
+       (member to (supertypes (class-of from)))
+       #t))
+
+; Every base class and interface of a class type, transitively, as Tui types.
+(define (supertypes t)
+  (let loop ([todo (direct-supertypes t)] [seen '()])
+    (cond
+      [(null? todo) seen]
+      [(member (car todo) seen) (loop (cdr todo) seen)]
+      [else (loop (append (cdr todo) (direct-supertypes (car todo))) (cons (car todo) seen))])))
+
+(define (direct-supertypes t)
+  (define d (class-desc t))
+  (cond
+    [(not d) '()]
+    [else
+     (define b (force (type-desc-base d)))
+     (filter values
+             (cons (and b (ref->tui b))
+                   (for/list ([i (in-list (force (type-desc-interfaces d)))]) (ref->tui i))))]))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Methods

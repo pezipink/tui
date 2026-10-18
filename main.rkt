@@ -25,6 +25,8 @@
          ... _ (for-syntax ... _)
          (for-syntax tui-type-of tui-member-return-type tui-type->string class-of
                      tui-resolve-type tui-has-default-ctor?
+                     tui-static-overloads tui-instance-overloads tui-member-names
+                     supertypes
                      typedExpr typedList typeName))
 
 (module reader syntax/module-reader tui)
@@ -250,6 +252,30 @@
 
   (define (make-tui-fun name params ret) (tui-fun name params ret))
 
+  ; Module values: (define name : T expr). The binding of name holds its declared type as syntax.
+  ; A reference loads the static field of <Module>, which is set when the program starts. While a
+  ; value's initializer is compiled, value-scope lists the values that are already set, and a
+  ; reference to any other module value is an error.
+  (define value-scope (make-parameter #f))
+
+  (struct tui-global (name type)
+    #:property prop:procedure
+    (λ (self stx)
+      (unless (identifier? stx)
+        (raise-syntax-error 'tui "module values are not first-class in Tui; use the name" stx))
+      (check-global-scope self stx)
+      (il (global-type self) (list `(ldsfld Program ,(tui-global-name self)
+                                            ,(tui-type->il (global-type self)))))))
+
+  (define (make-tui-global name type) (tui-global name type))
+
+  (define (global-type g) (ann->type (tui-global-type g)))
+
+  (define (check-global-scope g stx)
+    (define scope (value-scope))
+    (when (and scope (not (memq (tui-global-name g) scope)))
+      (raise-syntax-error 'tui "module value used before it is defined" stx)))
+
   (define (compile-tui-call f stx args)
     (define ptys (map ann->type (tui-fun-params f)))
     (define rty (ann->type (tui-fun-ret f)))
@@ -342,6 +368,35 @@
                 (cil managed)
                 (,@(locals-decl (mctx-locals m)) ,@code)))
 
+  ; A module value (define name : T expr). The field is a static field of <Module>, and the static
+  ; method __init_name computes the value. earlier lists the values that are set before this one.
+  (define (value-init-name name) (string->symbol (format "__init_~a" name)))
+
+  (define (value-parts def earlier)
+    (syntax-parse def
+      [(_ name:id (~datum :) t:id e)
+       (define rty (ann->type #'t))
+       (define-values (code m)
+         (run-passes
+          (λ ()
+            (parameterize ([value-scope (map syntax-e earlier)])
+              (compile-body def '() (list #'e) rty #f #f)))))
+       (values `(.method (public static) ,(tui-type->il rty) ,(value-init-name (syntax-e #'name))
+                         () (cil managed)
+                         (,@(locals-decl (mctx-locals m)) ,@code))
+               `(.field (public static) ,(tui-type->il rty) ,(syntax-e #'name)))]
+      [_ (raise-syntax-error 'tui "expected (define name : type expr)" def)]))
+
+  ; The static initializers, run in order at the start of the entry point. inits is a list of
+  ; (name type) in source order.
+  (define (value-inits inits)
+    (append*
+     (for/list ([i (in-list inits)])
+       (define name (car i))
+       (define t (tui-type->il (cadr i)))
+       `((call ,t (Program) ,(value-init-name name) ())
+         (stsfld Program ,name ,t)))))
+
   ; Whether the class type t derives from System.MulticastDelegate.
   (define (delegate-type? t)
     (let loop ([b (base-type t)])
@@ -406,7 +461,7 @@
 
 
   ; The entry point. With print? the value of the last form, if any, is written to the console.
-  (define (compile-main stx forms print?)
+  (define (compile-main stx forms print? [inits '()])
     (define-values (code locals)
       (run-passes
        (λ ()
@@ -424,7 +479,7 @@
                [else '((pop))]))
            (values (append code tail '((ret))) (mctx-locals (current-mctx)))))))
     `(.method (public static) void __tui_main () (cil managed)
-              ((.entrypoint) ,@(locals-decl locals) ,@code)))
+              ((.entrypoint) ,@(locals-decl locals) ,@(value-inits inits) ,@code)))
 
   (define (clr-call-instr op m)
     `(,op ,@(if (clr-method-static? m) '() '(instance))
@@ -439,7 +494,9 @@
     (syntax-parse f
       [(h:id . _)
        (cond
-         [(free-identifier=? #'h #'tui-define) 'define]
+         [(free-identifier=? #'h #'tui-define)
+          (let ([l (syntax->list f)])
+            (if (and (pair? (cdr l)) (identifier? (cadr l))) 'value 'define))]
          [(free-identifier=? #'h #'using) 'using]
          [(free-identifier=? #'h #'open) 'open]
          [(ormap (λ (k) (free-identifier=? #'h k))
@@ -489,7 +546,26 @@
     (and (pair? t)
          (let ([groups (find-instance-methods t name)])
            (for*/first ([g (in-list groups)] [m (in-list g)] #:when (zero? (clr-method-arity m)))
-             (clr-method-ret m))))))
+             (clr-method-ret m)))))
+
+  ; The number of public static methods named method-name on the type named type-name (a source
+  ; name such as "Console"). Every overload counts.
+  (define (tui-static-overloads type-name method-name)
+    (length (or (find-static-methods type-name method-name) '())))
+
+  ; The number of public instance methods named name on t and its base types. Every overload counts.
+  (define (tui-instance-overloads t name)
+    (for/sum ([g (in-list (find-instance-methods t name))]) (length g)))
+
+  ; The distinct public instance method names of the class type t, sorted. Constructors are left out.
+  (define (tui-member-names t)
+    (sort (remove-duplicates
+           (for/list ([m (in-list (type-methods (class-of t)))]
+                      #:unless (clr-method-static? m)
+                      #:unless (equal? (clr-method-name m) ".ctor"))
+             (clr-method-name m)))
+          string<?))
+  )
 
 ;; Syntax classes that give user macros the Tui types of their arguments. A pattern variable x of
 ;; class typedExpr has x.Type, the type the checker gives the expression. typedList also has x.Elem,
@@ -526,27 +602,54 @@
      (tui-configure! refs opens)
      (set-box! lifted-classes '())
      (define defs (of 'define))
+     (define vals (of 'value))
+     (define val-names (for/list ([v vals]) (list-ref (syntax->list v) 1)))
+     (define val-decls
+       (for/list ([v vals])
+         (let ([l (syntax->list v)])
+           #`(define-syntax #,(list-ref l 1)
+               (make-tui-global '#,(syntax-e (list-ref l 1)) (quote-syntax #,(list-ref l 3)))))))
+     (define val-methods
+       (for/list ([v vals] [i (in-naturals)])
+         #`(tui-value-decls #,v #,@(take val-names i))))
+     (define val-inits
+       (for/list ([v vals])
+         (let ([l (syntax->list v)]) #`(#,(list-ref l 1) #,(list-ref l 3)))))
      (with-syntax ([prog (datum->syntax stx '%tui-program)]
-                   [(decl ...) (map fun-declaration defs)]
+                   [(decl ...) (append (map fun-declaration defs) val-decls)]
                    [(name ...) (for/list ([d defs])
                                  (let-values ([(n p t r b) (fun-header d)]) n))]
                    [(def ...) defs]
+                   [(vdecl ...) val-methods]
+                   [(vinit ...) val-inits]
                    [(pass ...) (of 'passthrough)]
                    [(stmt ...) (of 'expr)])
        #`(#%module-begin
-          (begin-for-syntax (tui-configure! '#,refs '#,opens))
           pass ...
+          ; visiting a required Tui module resets the shared configuration, so set it again here
+          (begin-for-syntax (tui-configure! '#,refs '#,opens))
           decl ...
           (define prog
             (tui-lifting
              (make-tui-program (tui-reference-list)
-                               (list (cons 'name (tui-method def)) ...)
-                               (tui-main stmt ...))))
+                               (append (list (cons 'name (tui-method def)) ...) vdecl ...)
+                               (tui-main (vinit ...) stmt ...))))
           (provide (rename-out [prog tui-program]))
           (module+ main (run-tui-program prog))))]))
 
 (define-syntax (tui-reference-list stx)
   #`(quote #,(tui-references)))
+
+; The field and the initializer of a module value, as (name . datum) pairs. earlier are the names
+; of the values defined before it.
+(define-syntax (tui-value-decls stx)
+  (syntax-case stx ()
+    [(_ def earlier ...)
+     (let-values ([(init-method field) (value-parts #'def (syntax->list #'(earlier ...)))])
+       (define name (syntax-e (cadr (syntax->list #'def))))
+       (with-syntax ([pairs (datum->syntax #f (list (cons name field)
+                                                    (cons (value-init-name name) init-method)))])
+         #'(quote pairs)))]))
 
 ; Adds the lambda classes compiled so far to p. Use it only in a let body that follows the
 ; expression which compiled them (see tui-lifting), so the expansion order is right.
@@ -570,7 +673,10 @@
 
 (define-syntax (tui-main stx)
   (syntax-case stx ()
-    [(_ form ...) #`(quote #,(datum->syntax #f (compile-main stx (syntax->list #'(form ...)) #f)))]))
+    [(_ (init ...) form ...)
+     (let ([inits (for/list ([i (in-list (syntax->list #'(init ...)))])
+                    (syntax-case i () [(n t) (list (syntax-e #'n) (ann->type #'t))]))])
+       #`(quote #,(datum->syntax #f (compile-main stx (syntax->list #'(form ...)) #f inits))))]))
 
 (define-syntax (tui-main/print stx)
   (syntax-case stx ()
@@ -596,6 +702,7 @@
                  (tui-program-add-reference! #,prog #,p))]
        [(open) #`(begin-for-syntax (tui-add-open! #,(open-namespace #'form)))]
        [(passthrough) #'form]
+       [(value) (raise-syntax-error 'tui "module values can only be defined in a module" #'form)]
        [else #`(let ([m (tui-main/print form)])
                  (tui-lifts-into #,prog)
                  (run-tui-main #,prog m))])]))
@@ -772,8 +879,15 @@
   (syntax-parse stx
     [(_ x:id e)
      (define v (syntax-local-value #'x (λ () #f)))
-     (unless (tui-var? v) (raise-syntax-error 'tui "not a variable" #'x))
-     (il 'void (store-var v #'x (tc/expect #'e (tui-var-type v))))]))
+     (cond
+       [(tui-global? v)
+        (check-global-scope v #'x)
+        (define ty (global-type v))
+        (il 'void (append (tc/expect #'e ty)
+                          `((stsfld Program ,(tui-global-name v) ,(tui-type->il ty)))))]
+       [else
+        (unless (tui-var? v) (raise-syntax-error 'tui "not a variable" #'x))
+        (il 'void (store-var v #'x (tc/expect #'e (tui-var-type v))))])]))
 
 ; (fn Delegate (param ...) body ...+), or (fn (param ...) body ...+) when the expected type of the
 ; form (set by tc/expect as 'tui-expected) is the delegate type.

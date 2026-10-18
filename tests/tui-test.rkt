@@ -253,3 +253,46 @@
   (check-equal? (repl '(let ([k 4]) (Console.WriteLine (.Invoke (fn Func<int32> () (* k k))))))
                 '("16")))
 
+(test-case "LINQ works with stored lambdas, library macros and reference conversions"
+  (check-equal? (run-example "linq.rkt") '("56" "2275" "50" "3" "6")))
+
+(test-case "a List<string> argument converts to IEnumerable<string>, not object"
+  (check-equal?
+   (run-tui '(let ([names (new |System.Collections.Generic.List<string>|)])
+               (.Add names "a") (.Add names "b")
+               (Console.WriteLine (String.Concat names))))
+   '("ab")))
+
+(test-case "phase 1 macros read overloads, supertypes and members from metadata"
+  (check-equal? (run-example "phase1.rkt")
+                '("11" "9" "True" "False" "True" "False" "4" "Equals" "55")))
+
+(test-case "compose checks that both arguments are Func<int32, int32>"
+  (define fnlib-path (path->string (build-path examples "fnlib.rkt")))
+  (check-regexp-match #rx"compose needs Func<int32, int32> arguments, got int32"
+                      (tui-error `(require (file ,fnlib-path)) '(compose 1 square))))
+
+(test-case "module values are static fields set in source order, and set! updates them"
+  (check-equal? (run-example "values.rkt") '("5" "10" "17"))
+  (check-equal? (run-tui '(define (get) : int b)
+                         '(define b : int 7)
+                         '(Console.WriteLine (get)))
+                '("7")))
+
+(test-case "a module value cannot be read before its definition"
+  (check-regexp-match #rx"module value used before it is defined"
+                      (tui-error '(define a : int (+ b 1)) '(define b : int 1)))
+  (check-regexp-match #rx"module value used before it is defined"
+                      (tui-error '(define a : int a))))
+
+(test-case "the REPL does not define module values"
+  (define mod (build-path examples "basics.rkt"))
+  (dynamic-require mod #f)
+  (define ns (module->namespace mod))
+  (check-exn #rx"module values can only be defined in a module"
+             (λ () (parameterize ([current-namespace ns])
+                     (eval (namespace-syntax-introduce
+                            (datum->syntax #f '(#%top-interaction define x : int 1)))))))
+  (check-regexp-match #rx"expected \\(define name : type expr\\)"
+                      (tui-error '(define x : int))))
+

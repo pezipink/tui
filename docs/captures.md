@@ -210,9 +210,9 @@ Test gap: there is no test for a reference-type cell other than `string`.
   would reduce allocations. Not needed yet.
 - The discovery pass requires deterministic expansion (section 4). Nothing in the repo breaks this,
   but a macro that reads mutable phase-1 state could.
-- Design decisions were chosen as defaults: one generated class per lambda with cell fields,
-  two-pass discovery for cells, shared mutable cells. The user committed the work without explicitly
-  confirming them, so they should still be reviewed.
+- The user approved one generated class per lambda with cell fields, two-pass discovery for cells,
+  and shared mutable cells at the design check-in. The open question is only the first bullet:
+  whether captured variables should share one object.
 - The lift only places the class datum in the module. The generated class name comes from
   `gensym`, because the IL needs a symbol and a lifted identifier cannot be used there. The
   `lifted-classes` box is still needed to collect the lifted identifiers.
