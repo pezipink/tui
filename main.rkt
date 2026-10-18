@@ -298,7 +298,7 @@
                               e (car a)))
         (cons (car a) t)))
     (define-values (fty fcode) (tc (compile-lambda e #f typed (cddr xs))))
-    (unless (bind-type p fty slots)
+    (unless (bind-type p fty slots (make-vector (vector-length slots) #f))
       (raise-syntax-error 'tui (format "fn has type ~a, which does not fit ~a"
                                        (tui-type->string fty) (tui-type->string p))
                           e))
@@ -936,11 +936,14 @@
     [(_ head . _) (raise-syntax-error 'tui "only named functions can be called" stx #'head)]))
 
 (begin-for-syntax
-  ; The explicit type arguments of a call, as in Enumerable.Where<int32>.
+  ; The explicit type arguments of a call, as in Enumerable.Where<int32>. A _ is #f, to be inferred.
   (define (explicit-targs head text)
     (for/list ([s (in-list (split-type-args text))])
-      (or (with-clr head (λ () (string->tui-type s)))
-          (raise-syntax-error 'tui (format "unknown type argument ~a" s) head))))
+      (cond
+        [(equal? s "_") #f]
+        [else
+         (or (with-clr head (λ () (string->tui-type s)))
+             (raise-syntax-error 'tui (format "unknown type argument ~a" s) head))])))
 
   (define (compile-static-call stx head type-name method-name args explicit)
     (define-values (tys codes) (tc-args args))

@@ -47,9 +47,53 @@
   (check-equal?
    (run-tui '(Console.WriteLine (.get_Length (System.Activator.CreateInstance<System.Text.StringBuilder>))))
    '("0"))
-  (check-true
-   (regexp-match? #rx"no overload"
-                  (tui-error '(System.Tuple.Create<int> 1 2)))))
+  (check-equal?
+   (run-tui '(let ([t (System.Tuple.Create<int> 1 2)])
+               (Console.WriteLine (.get_Item2 t))))
+   '("2"))
+  (check-regexp-match #rx"no overload"
+                      (tui-error '(|System.Tuple.Create<int, int, int>| 1 2))))
+
+(test-case "generic parameters are inferred from list and delegate variable arguments"
+  (check-equal?
+   (run-tui '(using "System.Core") '(open System.Linq)
+            '(let ([xs (new |System.Collections.Generic.List<int32>|)])
+               (.Add xs 1) (.Add xs 2) (.Add xs 3)
+               (let ([even? (fn ([x : int]) (= (% x 2) 0))])
+                 (Console.WriteLine (Enumerable.Count (Enumerable.Where xs even?)))
+                 (Console.WriteLine (Enumerable.Sum (Enumerable.Select xs (fn ([x : int]) (* x x))))))))
+   '("1" "14")))
+
+(test-case "type arguments may be _ or omitted at the end, and the rest are inferred"
+  (define (linq call)
+    (run-tui '(using "System.Core") '(open System.Linq)
+             `(let ([xs (new |System.Collections.Generic.List<int32>|)])
+                (.Add xs 1) (.Add xs 2) (.Add xs 3) (.Add xs 4)
+                (let ([even? (fn ([x : int]) (= (% x 2) 0))])
+                  (Console.WriteLine ,call)))))
+  (define square-fn '(fn ([x : int]) (* x x)))
+  (check-equal? (linq '(Enumerable.Count<_> (Enumerable.Where<_> xs even?))) '("2"))
+  (check-equal? (linq '(Enumerable.Count<int32> (Enumerable.Where xs even?))) '("2"))
+  (check-equal? (linq `(let ([evens (Enumerable.Where xs even?)])
+                         (Enumerable.Sum (Enumerable.Select<_> evens ,square-fn))))
+                '("20"))
+  (check-equal? (linq `(let ([evens (Enumerable.Where xs even?)])
+                         (Enumerable.Sum (|Enumerable.Select<int32, _>| evens ,square-fn))))
+                '("20"))
+  (check-equal? (linq `(let ([evens (Enumerable.Where xs even?)])
+                         (Enumerable.Sum (|Enumerable.Select<_, _>| evens ,square-fn))))
+                '("20"))
+  (define (linq-error call)
+    (tui-error '(using "System.Core") '(open System.Linq)
+               `(Console.WriteLine ,call)))
+  (check-regexp-match #rx"no overload of Enumerable.Count accepts \\(System.Collections.Generic.List<int32>\\) with type arguments <int32, int32>"
+                      (linq-error '(|Enumerable.Count<int32, int32>|
+                                    (new |System.Collections.Generic.List<int32>|))))
+  (check-regexp-match #rx"with type arguments <_>"
+                      (linq-error '(Enumerable.Count (Enumerable.Empty<_>))))
+  (check-regexp-match #rx"with type arguments <string>"
+                      (linq-error '(Enumerable.Count<string>
+                                    (new |System.Collections.Generic.List<int32>|)))))
 
 (test-case "generic instances call members on the open signature"
   (check-equal?

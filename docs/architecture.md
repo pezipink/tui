@@ -153,7 +153,10 @@ Each parameter is matched against its argument, in order:
   same generic definition (`matching-supertype`). A `List<int32>` argument fixes `!!0` to `int32`.
 - A placeholder binds nothing. A type argument that occurs only in bare-fn parameters stays open
   (`lambda-only?`). The fn's body fixes it in `finish-call`.
-- Explicit type arguments (`Name<A>`) are used as given. Their count must match the method's arity.
+- Explicit type arguments (`Name<A>`) are used as given and are not bound from the arguments, so an
+  argument that differs is left to the coercion check. The list may be shorter than the arity, and a
+  `_` (or a missing entry) is inferred as below: `|Select<int32, _>|` and `Select<_>` both work. A
+  list longer than the arity matches no overload.
 
 Other parameters are checked by `coercion` after the method is closed. Nothing else is inferred.
 
@@ -183,6 +186,7 @@ parameter must be annotated.
 ### Examples
 
 - `(Enumerable.Where<int32> xs (fn (x) (> x 2)))` is accepted. The explicit type argument fixes it.
+- `(Enumerable.Where xs even?)` with `even?` a variable of type `Func<int32, bool>` is accepted. The type arguments are bound from the argument types. A generic parameter matched against a class with a base chain (for example `List<T>` or a delegate, whose chain ends at `object`) skips the non-class `object` entry in `matching-supertype`.
 - `(Enumerable.Where xs (fn (x) (> x 2)))` is accepted when `xs` is a `List<int32>`. Its
   `IEnumerable<int32>` base fixes `!!0`, and the `fn` takes `Func<int32, bool>`.
 - `(Enumerable.Sum (Enumerable.Select xs (fn (x) (* x 2))))` fixes `Select`'s `TSource` from `xs` and
@@ -425,6 +429,8 @@ and run `raco make main.rkt`.
 | (inline tests) | bare `fn` argument fixes a method type parameter that only it mentions | `a bare fn argument fixes a method type parameter that only it mentions` |
 | (inline tests) | unannotated `fn` parameter takes the type of the one overload its body fixes | `an unannotated fn parameter takes the type of the one overload a call in its body fixes` |
 | (inline tests) | each source (expected type, overload, generic type argument, body, Phase D) with and without annotations, and mismatches | `each inference source works with and without annotations` |
+| (inline tests) | generic parameters bound from a `List<T>` and from a delegate variable | `generic parameters are inferred from list and delegate variable arguments` |
+| (inline tests) | type arguments as `_` or omitted at the end, and the errors for too many, uninferrable and conflicting ones | `type arguments may be _ or omitted at the end, and the rest are inferred` |
 | `macros.rkt` | hygienic macros | `Tui macros are hygienic` |
 | `types.rkt` | `default-of`, `type-name-of` | `default-of takes a type name ...`, `type-name-of expands ...` |
 | `lists.rkt` | `list-of`, `sum-of` | `the list-of example runs`, `sum-of reads the element type ...` |

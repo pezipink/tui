@@ -431,27 +431,30 @@
   (define ca (class-of a))
   (and (pair? ca) (eq? (car ca) 'class)
        (for/first ([s (in-list (cons ca (supertypes ca)))]
-                   #:when (and (equal? (generic-key s) (generic-key p))
+                   #:when (and (pair? s)
+                               (equal? (generic-key s) (generic-key p))
                                (= (length (class-args s)) (length (class-args p)))))
          s)))
 
 ; Matches a parameter type p against an argument type a, binding the method type parameters in
 ; slots. A generic instance parameter matches the argument's supertype of the same definition, so
 ; List<int32> fixes !!0 in IEnumerable<!!0>. Returns #f on a conflict. A lambda placeholder binds
-; nothing.
-(define (bind-type p a slots)
+; nothing. A type parameter that fixed names (a non-#f entry of fixed) is not bound at all, so an
+; argument that differs from it is left to the coercion check.
+(define (bind-type p a slots fixed)
   (cond
     [(lambda-placeholder? a) #t]
     [(and (pair? p) (eq? (car p) 'mvar))
      (define i (cadr p))
-     (cond [(not (vector-ref slots i)) (vector-set! slots i a) #t]
+     (cond [(vector-ref fixed i) #t]
+           [(not (vector-ref slots i)) (vector-set! slots i a) #t]
            [else (equal? (vector-ref slots i) a)])]
     [(and (pair? p) (eq? (car p) 'class) (has-mvar? p))
      (define s (matching-supertype a p))
      ; An argument that is not an instance of p is left to the coercion check once closed.
      (or (not s)
          (for/and ([pp (in-list (class-args p))] [sa (in-list (class-args s))])
-           (bind-type pp sa slots)))]
+           (bind-type pp sa slots fixed)))]
     [else #t]))
 
 ; Whether type parameter i occurs in some bare fn parameter and in no other parameter, so that the
@@ -463,21 +466,25 @@
        (for/and ([p (in-list params)] [a (in-list arg-types)])
          (or (lambda-placeholder? a) (not (occurs? p))))))
 
-; The type arguments of a generic method call, or #f when they cannot be fixed. Explicit ones are
-; used as given. Otherwise a parameter that is exactly !!n takes the type of its argument, and every
-; !!n must be fixed that way with one type. Other parameters are checked by coercion once closed.
-; A type argument that only bare fn parameters mention is left #f, to be fixed by the fn's body.
+; The type arguments of a generic method call, or #f when they cannot be fixed. explicit may name
+; fewer type arguments than the method has, with #f for each one left to infer (Select<int32, _>),
+; but not more. Named type arguments are used as given. Otherwise a parameter that is exactly !!n
+; takes the type of its argument, and every !!n must be fixed that way with one type. Other
+; parameters are checked by coercion once closed. A type argument that only bare fn parameters
+; mention is left #f, to be fixed by the fn's body.
 (define (infer-targs m arg-types explicit)
   (define k (clr-method-arity m))
-  (cond
-    [(pair? explicit) (and (= (length explicit) k) explicit)]
-    [else
-     (define params (clr-method-params m))
-     (define slots (make-vector k #f))
-     (and (for/and ([p (in-list params)] [a (in-list arg-types)]) (bind-type p a slots))
-          (for/and ([i (in-range k)])
-            (or (vector-ref slots i) (lambda-only? i params arg-types)))
-          (vector->list slots))]))
+  (define params (clr-method-params m))
+  (define fixed
+    (for/vector #:length k ([i (in-range k)])
+      (and (< i (length explicit)) (list-ref explicit i))))
+  (define slots (make-vector k #f))
+  (and (<= (length explicit) k)
+       (for/and ([p (in-list params)] [a (in-list arg-types)]) (bind-type p a slots fixed))
+       (for/and ([i (in-range k)])
+         (or (vector-ref fixed i) (vector-ref slots i) (lambda-only? i params arg-types)))
+       (for/list ([i (in-range k)])
+         (or (vector-ref fixed i) (vector-ref slots i)))))
 
 ; t with each (mvar n) replaced by the nth of targs, where that is not #f.
 (define (subst-mvars t targs)
@@ -514,8 +521,13 @@
   (let loop ([groups groups])
     (cond
       [(null? groups)
-       (error 'tui "no overload of ~a accepts (~a)" describe
-              (string-join (map tui-type->string arg-types) " "))]
+       (error 'tui "no overload of ~a accepts (~a)~a" describe
+              (string-join (map tui-type->string arg-types) " ")
+              (if (null? explicit)
+                  ""
+                  (format " with type arguments <~a>"
+                          (string-join (map (λ (t) (if t (tui-type->string t) "_")) explicit)
+                                       ", "))))]
       [else
        (define scored (for*/list ([m (in-list (car groups))] [s (in-value (score m))] #:when s) s))
        (cond
