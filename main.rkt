@@ -8,7 +8,7 @@
 (require (for-syntax racket/base racket/list racket/string syntax/parse syntax/parse/define
                      "private/clr.rkt")
          syntax/parse/define
-         (only-in syntax/parse define-syntax-class pattern)
+         (only-in syntax/parse define-syntax-class define-splicing-syntax-class pattern)
          "private/runtime.rkt")
 
 (provide (rename-out [tui-module-begin #%module-begin]
@@ -21,6 +21,8 @@
                      [tui-< <] [tui-> >] [tui-<= <=] [tui->= >=] [tui-= =])
          ; syntax-rules compiles its patterns at phase 1, so the ellipsis is needed there too
          using open define-syntax-rule define-syntax define-syntax-parser require provide
+         define-simple-macro define-syntax-class define-splicing-syntax-class pattern
+         begin-for-syntax define-for-syntax define-syntaxes
          for-syntax file
          ... _ (for-syntax ... _)
          (for-syntax tui-type-of tui-member-return-type tui-type->string class-of
@@ -689,6 +691,9 @@
          [(free-identifier=? #'h #'open) 'open]
          [(ormap (λ (k) (free-identifier=? #'h k))
                  (list #'define-syntax-rule #'define-syntax #'define-syntax-parser
+                       #'define-simple-macro #'define-syntax-class
+                       #'define-splicing-syntax-class
+                       #'begin-for-syntax #'define-for-syntax #'define-syntaxes
                        #'require #'provide))
           'passthrough]
          [else 'expr])]

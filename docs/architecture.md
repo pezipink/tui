@@ -39,7 +39,7 @@ For a file `m.rkt` written in `#lang tui`:
    - `using` and `open` change the CLR configuration.
    - `define` declares a function.
    - `value` is a module-level value define (section 8).
-   - `passthrough` is a Racket macro definition or `require`/`provide`, emitted unchanged.
+   - `passthrough` is a Racket macro definition, a phase-1 definition (`define-syntax-class`, `define-splicing-syntax-class`, `define-simple-macro`, `begin-for-syntax`, `define-for-syntax`, `define-syntaxes`) or `require`/`provide`, emitted unchanged.
    - `expr` is a top-level expression, collected into the entry point.
 3. **Configuration.** `tui-configure!` is called with the references (mscorlib plus each `using`)
    and the open namespaces (`System` plus each `open`). It is called again inside the emitted
@@ -437,6 +437,8 @@ and run `raco make main.rkt`.
 | `linq.rkt` | LINQ over stored lambdas, reference conversions | `LINQ works with stored lambdas, library macros and reference conversions` |
 | `fnlib.rkt` | `compose` and `square` library macros | `compose checks that both arguments are Func<int32, int32>` |
 | `phase1.rkt` | metadata helpers at expansion time | `phase 1 macros read overloads, supertypes and members from metadata` |
+| `syntax-classes.rkt` | syntax classes, `define-simple-macro`, phase-1 helpers | `phase 1 definitions: syntax classes, simple macros and phase-1 helpers` |
+| `threading.rkt` | `threading`'s `~>` and `~>>` | `threading's ~> and ~>> compile to ordinary Tui calls` |
 | `values.rkt` | module values, `set!`, initialization order | `module values are static fields set in source order, and set! updates them` |
 
 ## 17. Known limits

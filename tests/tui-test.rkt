@@ -471,6 +471,30 @@
   (check-equal? (run-example "phase1.rkt")
                 '("11" "9" "True" "False" "True" "False" "4" "Equals" "55")))
 
+(test-case "threading's ~> and ~>> compile to ordinary Tui calls"
+  (check-equal? (run-example "threading.rkt") '("14" "5" "11" "TUI" "pipe"))
+  (check-regexp-match #rx"unbound function"
+                     (tui-error '(require threading) '(Console.WriteLine (as~> 3 x (+ x 1))))))
+
+(test-case "phase 1 definitions: syntax classes, simple macros and phase-1 helpers"
+  (check-equal? (run-example "syntax-classes.rkt") '("42" "10" "29"))
+  (check-equal? (run-tui '(require (for-syntax racket/base syntax/parse))
+                        '(define-syntaxes (inc) (lambda (stx) (syntax-case stx () [(_ x) #'(+ x 1)])))
+                        '(Console.WriteLine (inc 41)))
+                '("42"))
+  (check-equal? (run-tui '(require (for-syntax racket/base syntax/parse))
+                        '(begin-for-syntax
+                           (define-splicing-syntax-class pair
+                             (pattern (~seq a:nat b:nat) #:attr total (+ (syntax-e #'a) (syntax-e #'b)))))
+                        '(define-syntax-parser pair-total [(_ p:pair) #`#,(attribute p.total)])
+                        '(Console.WriteLine (pair-total 3 4)))
+                '("7"))
+  (check-regexp-match #rx"twice: expected"
+                     (tui-error '(require (for-syntax racket/base syntax/parse))
+                                '(begin-for-syntax (define-syntax-class small (pattern n:nat)))
+                                '(define-simple-macro (twice x:small) (+ x x))
+                                '(Console.WriteLine (twice -1)))))
+
 (test-case "compose checks that both arguments are Func<int32, int32>"
   (define fnlib-path (path->string (build-path examples "fnlib.rkt")))
   (check-regexp-match #rx"compose needs Func<int32, int32> arguments, got int32"
