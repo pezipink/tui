@@ -19,6 +19,7 @@
                      [tui-define define] [tui-let let] [tui-set! set!] [tui-if if]
                      [tui-record record]
                      [tui-while while] [tui-begin begin] [tui-and and] [tui-or or] [tui-not not]
+                     [tui-try try] [tui-throw throw] [tui-rethrow rethrow]
                      [tui-new new] [tui-list-of list-of] [tui-fn fn]
                      [tui-array array] [tui-new-array new-array] [tui-aref aref]
                      [tui-for-each for-each]
@@ -57,6 +58,13 @@
 
 (define-syntax-rule (define-tui-form (name stx) body ...)
   (define-syntax name (module-body-form (λ (stx) body ...))))
+
+; The 'tui-stmt mark says that a form is entered with an empty evaluation stack, which is where a
+; try may appear (see tui-try). A transparent form passes the mark to the sub-forms it evaluates
+; directly, and the form is returned unchanged otherwise.
+(begin-for-syntax
+  (define (inherit-stmt from to)
+    (if (syntax-property from 'tui-stmt) (syntax-property to 'tui-stmt #t) to)))
 
 ; These forms are handled by tui-module-begin and tui-top-interaction.
 (define-for-syntax (top-level-only what)
@@ -208,9 +216,12 @@
          (values ty (cadr p)))]
       [_ (raise-syntax-error 'tui "not a Tui expression" stx)]))
 
-  ; Expands stx and converts it to type `to`, or raises a type error at stx.
-  (define (tc/expect stx to [origin stx])
+  ; Expands stx and converts it to type `to`, or raises a type error at stx. With #:assign? the
+  ; value cannot be never, since a variable or element would never receive it.
+  (define (tc/expect stx to [origin stx] #:assign? [assign? #f])
     (define-values (ty code) (tc (syntax-property stx 'tui-expected to) #f origin))
+    (when (and assign? (eq? ty 'never))
+      (raise-syntax-error 'tui "cannot assign a value that never completes" stx))
     (define c (coercion ty to))
     (unless c
       (raise-syntax-error 'tui (format "type mismatch: expected ~a, got ~a"
@@ -572,7 +583,7 @@
   ; conversion and ret, the mctx that holds the locals and the lambda's env, and the return type.
   (define (compile-body stx binds body rty parent owner)
     (define m (new-mctx parent))
-    (parameterize ([current-mctx m])
+    (parameterize ([current-mctx m] [in-catch-handler #f])
       (define-values (body-start body-end) (forms-span body))
       ; A captured argument is copied into a cell, so the lambda and its enclosing method share it.
       (define-values (cell-binds arg-code)
@@ -601,10 +612,14 @@
       (define tail-body
         (for/list ([b (in-list body)] [i (in-naturals 1)])
           (if (and (= i n) rty (not (eq? rty 'void))) (syntax-property b 'tui-expected rty) b)))
-      (define-values (bty code) (tc/bind cell-binds #`(tui-begin #,@tail-body)))
+      (define-values (bty code) (tc/bind cell-binds (syntax-property #`(tui-begin #,@tail-body) 'tui-stmt #t)))
+      (when (and (not rty) (eq? bty 'never))
+        (raise-syntax-error 'tui "cannot infer a result type: the body always throws, so annotate the result type"
+                            stx))
       (define ret-code
         (cond
           [(not rty) '()]
+          [(eq? bty 'never) '()]
           [(eq? rty 'void) (if (eq? bty 'void) '() '((pop)))]
           [(coercion bty rty) => cdr]
           [else (raise-syntax-error 'tui (format "function returns ~a but its body has type ~a"
@@ -838,7 +853,7 @@
       (run-passes
        (λ ()
          (parameterize ([current-mctx (new-mctx #f)])
-           (define-values (ty code) (tc/bind '() #`(tui-begin #,@forms)))
+           (define-values (ty code) (tc/bind '() (syntax-property #`(tui-begin #,@forms) 'tui-stmt #t)))
            (define tail
              (cond
                [(eq? ty 'void) '()]
@@ -1495,8 +1510,9 @@
   ; each element in turn. anns is () or (T), the loop variable's annotation.
   (define (lower-for-each stx x anns e bodies)
     (define src (syntax-property (datum->syntax x (gensym 'src)) 'tui-expr e))
-    (quasisyntax/loc stx
-      (tui-let ([#,src #,e]) (tui-for-each-loop #,src #,x #,anns #,@bodies)))))
+    (inherit-stmt stx
+     (quasisyntax/loc stx
+      (tui-let ([#,src #,e]) (tui-for-each-loop #,src #,x #,anns #,@bodies))))))
 
 ; The IEnumerator<T> of a sequence, from GetEnumerator on IEnumerable<T>. An array implements
 ; IEnumerable<T>, so it needs no conversion.
@@ -1553,17 +1569,19 @@
      (cond
        [(szarray-type? ty)
         (define i (datum->syntax #'src (gensym 'i)))
-        (quasisyntax/loc stx
+        (inherit-stmt stx
+         (quasisyntax/loc stx
           (tui-let ([#,i (tui-datum . 0)])
             (tui-while (tui-< #,i (tui-alen src))
               (tui-begin #,(bind #`(tui-aref src #,i))
-                         (tui-set! #,i (tui-+ #,i (tui-datum . 1)))))))]
+                         (tui-set! #,i (tui-+ #,i (tui-datum . 1))))))))]
        [(enumerable-element ty)
         (define en (datum->syntax #'src (gensym 'en)))
-        (quasisyntax/loc stx
+        (inherit-stmt stx
+         (quasisyntax/loc stx
           (tui-let ([#,en (tui-enumerator src)])
             (tui-while (tui-enum-move #,en)
-              #,(bind #`(tui-enum-current #,en)))))]
+              #,(bind #`(tui-enum-current #,en))))))]
        [else
         (raise-syntax-error 'tui (format "for-each needs an array or IEnumerable<T>, got ~a"
                                          (tui-type->string ty))
@@ -1575,17 +1593,22 @@
     [(_ e ... last)
      (define code
        (append* (for/list ([e (syntax->list #'(e ...))])
-                  (define-values (ty code) (tc e))
-                  (if (eq? ty 'void) code (append code '((pop)))))))
-     (define-values (ty last-code) (tc #'last))
+                  (define-values (ty code) (tc (inherit-stmt stx e)))
+                  (if (memq ty '(void never)) code (append code '((pop)))))))
+     (define-values (ty last-code) (tc (inherit-stmt stx #'last)))
      (il ty (append code last-code))]))
 
 (define-tui-form (tui-let stx)
   (syntax-parse stx
     [(_ ([x:id e] ...) body ...+)
-     (define-values (tys codes) (tc* (syntax->list #'(e ...))))
+     (define-values (tys codes)
+       (for/lists (tys codes) ([s (in-list (syntax->list #'(e ...)))]) (tc (inherit-stmt stx s))))
      (for ([ty tys] [e (syntax->list #'(e ...))])
-       (when (eq? ty 'void) (raise-syntax-error 'tui "cannot bind a void value" e)))
+       (when (memq ty '(void never))
+         (raise-syntax-error 'tui (if (eq? ty 'void)
+                                      "cannot bind a void value"
+                                      "cannot bind a value that never completes")
+                             e)))
      (define xs (syntax->list #'(x ...)))
      (for ([x (in-list xs)] [t (in-list tys)]) (record-tooltip! x t))
      (let-values ([(start end) (forms-span (syntax->list #'(body ...)))])
@@ -1595,22 +1618,27 @@
      (define slots (for/list ([ty tys] [c? cells?]) (alloc-local! stx (if c? (cell-of ty) ty))))
      ; A cell is created each time the let runs, so each run (for example, each loop iteration)
      ; gets a fresh variable.
+     ; A cell's value is computed before the cell's array is pushed, so that the value can be a try
+     ; (which needs an empty stack).
      (define init
        (append*
         (for/list ([c codes] [slot slots] [ty tys] [c? cells?])
           (if c?
-              (append (new-cell-code ty)
-                      (list (var-instr 'st 'local slot)
-                            (var-instr 'ld 'local slot)
-                            '(ldc.i4.0))
-                      c
-                      (list `(stelem ,(tui-type->il ty))))
+              (let ([tmp (alloc-local! stx ty)])
+                (append c
+                        (list (var-instr 'st 'local tmp))
+                        (new-cell-code ty)
+                        (list (var-instr 'st 'local slot)
+                              (var-instr 'ld 'local slot)
+                              '(ldc.i4.0)
+                              (var-instr 'ld 'local tmp)
+                              `(stelem ,(tui-type->il ty)))))
               (append c (list (var-instr 'st 'local slot)))))))
      (define-values (ty code)
        (tc/bind (for/list ([x (in-list xs)] [slot (in-list slots)] [t (in-list tys)]
                            [c? (in-list cells?)] [ord (in-list ords)])
                   (list x (if c? 'cell 'local) slot t ord))
-                #'(tui-begin body ...)))
+                (inherit-stmt stx #'(tui-begin body ...))))
      (il ty (append init code))]))
 
 (define-tui-form (tui-set! stx)
@@ -1620,7 +1648,7 @@
      (unless (szarray-type? aty)
        (raise-syntax-error 'tui (format "~a is not an array" (tui-type->string aty)) #'a))
      (define elem (szarray-elem aty))
-     (il 'void (append acode (tc/expect #'i 'int32) (tc/expect #'e elem)
+     (il 'void (append acode (tc/expect #'i 'int32) (tc/expect #'e elem #:assign? #t)
                        `((stelem ,(tui-type->il elem)))))]
     [(_ x:id e)
      (define v (syntax-local-value #'x (λ () #f)))
@@ -1637,12 +1665,12 @@
         (check-global-scope v #'x)
         (define ty (global-result-type v #'x))
         (record-tooltip! #'x ty)
-        (il 'void (append (tc/expect #'e ty)
+        (il 'void (append (tc/expect #'e ty #:assign? #t)
                           `((stsfld Program ,(tui-global-name v) ,(tui-type->il ty)))))]
        [else
         (unless (tui-var? v) (raise-syntax-error 'tui "not a variable" #'x))
         (record-tooltip! #'x (tui-var-type v))
-        (il 'void (store-var v #'x (tc/expect #'e (tui-var-type v))))])]))
+        (il 'void (store-var v #'x (tc/expect #'e (tui-var-type v) #:assign? #t)))])]))
 
 ; (fn Delegate (param ...) body ...+), or (fn (param ...) body ...+) when the expected type of the
 ; form (set by tc/expect as 'tui-expected) is the delegate type. A param is id or [id : type]. With
@@ -1660,14 +1688,18 @@
 
 (define-tui-form (tui-if stx)
   (syntax-parse stx
-    [(_ c t) #'(tui-if c (tui-begin t (tui-begin)) (tui-begin))]
+    [(_ c t)
+     (define then (inherit-stmt stx #'(tui-begin t (tui-begin))))
+     (inherit-stmt stx #`(tui-if c #,then (tui-begin)))]
     [(_ c t e)
-     (define ccode (tc/expect #'c 'bool))
-     (define-values (tty tcode) (tc #'t))
-     (define-values (ety ecode) (tc #'e))
+     (define ccode (tc/expect (inherit-stmt stx #'c) 'bool))
+     (define-values (tty tcode) (tc (inherit-stmt stx #'t)))
+     (define-values (ety ecode) (tc (inherit-stmt stx #'e)))
      (define-values (ty tc2 ec2)
        (cond
          [(equal? tty ety) (values tty tcode ecode)]
+         [(eq? tty 'never) (values ety tcode ecode)]
+         [(eq? ety 'never) (values tty tcode ecode)]
          [(eq? tty 'void) (values 'void tcode (append ecode '((pop))))]
          [(eq? ety 'void) (values 'void (append tcode '((pop))) ecode)]
          [(coercion tty ety) => (λ (c) (values ety (append tcode (cdr c)) ecode))]
@@ -1685,9 +1717,220 @@
     [(_ c body ...)
      (define top (fresh-label! stx 'while))
      (define end (fresh-label! stx 'endwhile))
-     (define ccode (tc/expect #'c 'bool))
-     (define-values (ty bcode) (tc #'(tui-begin body ... (tui-begin))))
+     (define ccode (tc/expect (inherit-stmt stx #'c) 'bool))
+     (define-values (ty bcode) (tc (inherit-stmt stx #'(tui-begin body ... (tui-begin)))))
      (il 'void (append `((label ,top)) ccode `((brfalse ,end)) bcode `((br ,top) (label ,end))))]))
+
+; Exceptions. try lowers to .try clauses (see tui-try). in-catch-handler is true while a catch
+; handler of the current method is expanded, which is where rethrow is valid.
+(begin-for-syntax
+  (define in-catch-handler (make-parameter #f))
+
+  (define (exception-type stx)
+    (with-clr stx (λ () (string->tui-type "System.Exception"))))
+
+  ; The keyword (catch or finally) that starts a try clause, or #f for any other form.
+  (define (clause-keyword f)
+    (define parts (syntax->list f))
+    (and parts (pair? parts) (identifier? (car parts))
+         (memq (syntax-e (car parts)) '(catch finally))
+         (syntax-e (car parts))))
+
+  ; A catch clause: its syntax, the exception variable, its type, its handler forms, and whether
+  ; it catches every exception (no type given).
+  (struct catch-clause (stx name type forms all?))
+  ; A catch clause after expansion: the (asm ty) of its .try clause, the code that stores the
+  ; exception object (it is on the stack when the handler starts), its type and its body code.
+  (struct handler-part (owner prefix type code))
+
+  (define (parse-catch c)
+    (define cc
+      (syntax-parse c
+        [(_ [e:id (~datum :) t:id] h ...+)
+         (catch-clause c #'e (ann->type #'t) (syntax->list #'(h ...)) #f)]
+        [(_ e:id h ...+)
+         (catch-clause c #'e (exception-type c) (syntax->list #'(h ...)) #t)]
+        [_ (raise-syntax-error 'tui "expected (catch [name : Type] handler ...+) or (catch name handler ...+)" c)]))
+    (define ty (catch-clause-type cc))
+    (unless (coercion ty (exception-type c))
+      (raise-syntax-error 'tui (format "catch needs an exception type, got ~a" (tui-type->string ty)) c))
+    cc)
+
+  ; The (asm ty) of a .try catch clause. Only a non-generic type from another assembly can be
+  ; named there.
+  (define (catch-owner stx ty)
+    (define il (tui-type->il ty))
+    (unless (and (pair? il) (= (length il) 2) (pair? (cadr il)) (= (length (cadr il)) 2))
+      (raise-syntax-error 'tui (format "cannot catch ~a" (tui-type->string ty)) stx))
+    (cadr il))
+
+  (define (parse-finally c)
+    (syntax-parse c
+      [(_ f ...+) (syntax->list #'(f ...))]
+      [_ (raise-syntax-error 'tui "expected (finally cleanup ...+)" c)])))
+
+(define-tui-form (tui-throw stx)
+  (syntax-parse stx
+    [(_ e)
+     (define exn (exception-type stx))
+     (define-values (ty code) (tc (syntax-property #'e 'tui-expected exn) #f #'e))
+     (define c (and (not (eq? ty 'never)) (coercion ty exn)))
+     (unless c
+       (raise-syntax-error 'tui (format "throw needs an exception, got ~a" (tui-type->string ty)) #'e))
+     (il 'never (append code (cdr c) '((throw))))]
+    [_ (raise-syntax-error 'tui "expected (throw exception)" stx)]))
+
+(define-tui-form (tui-rethrow stx)
+  (syntax-parse stx
+    [(_)
+     (unless (in-catch-handler)
+       (raise-syntax-error 'tui "rethrow is only allowed in a catch handler" stx))
+     (il 'never '((rethrow)))]
+    [_ (raise-syntax-error 'tui "expected (rethrow)" stx)]))
+
+; (try body ...+ clause ...), where a clause is (catch [name : Type] handler ...+), (catch name
+; handler ...+) for any exception, or (finally cleanup ...+) as the last clause.
+;
+; The value of the body and of each handler goes to a result local r, and every branch leaves the
+; protected region with leave:
+;   ots:  ts:  body; stloc r; leave after-catch
+;         te:
+;         hs:  stloc ex; handler; stloc r; leave after-catch     (one per catch clause)
+;         he:
+;   after-catch: leave after-all                                  (only with finally)
+;   ote:  fhs: cleanup; endfinally                                (only with finally)
+;         fhe:
+;   after-all: ldloc r
+; The clauses are .try entries over [ts, te), in source order, and the finally is an outer .try
+; over [ots, ote). A branch whose type is never ends in throw or rethrow, so it gets no stloc or leave.
+(define-tui-form (tui-try stx)
+  (unless (syntax-property stx 'tui-stmt)
+    (raise-syntax-error 'tui "try must be a statement; its value would be on the evaluation stack here"
+                        stx))
+  (define-values (body-forms clause-forms)
+    (splitf-at (cdr (syntax->list stx)) (λ (f) (not (clause-keyword f)))))
+  (when (null? body-forms) (raise-syntax-error 'tui "try needs a body" stx))
+  (when (null? clause-forms) (raise-syntax-error 'tui "try needs a catch or finally clause" stx))
+  (define kinds (map clause-keyword clause-forms))
+  (for ([f (in-list clause-forms)] [k (in-list kinds)] [i (in-naturals 1)])
+    (cond
+      [(not k) (raise-syntax-error 'tui "expected a catch or finally clause" f)]
+      [(and (eq? k 'finally) (< i (length clause-forms)))
+       (raise-syntax-error 'tui "finally must be the last clause of try" f)]))
+  (define finally? (eq? (last kinds) 'finally))
+  (define catches
+    (for/list ([c (in-list (if finally? (drop-right clause-forms 1) clause-forms))])
+      (parse-catch c)))
+  (for ([cc (in-list catches)] [i (in-naturals 1)])
+    (when (and (catch-clause-all? cc) (< i (length catches)))
+      (raise-syntax-error 'tui "a catch-all clause must be the last catch clause" (catch-clause-stx cc))))
+  (define fin-forms (if finally? (parse-finally (last clause-forms)) '()))
+
+  (define-values (bty bcode)
+    (tc (syntax-property #`(tui-begin #,@body-forms) 'tui-stmt #t)))
+
+  (define (expand-catch cc)
+    (define ety (catch-clause-type cc))
+    (define e (catch-clause-name cc))
+    (define hforms (catch-clause-forms cc))
+    (define owner (catch-owner (catch-clause-stx cc) ety))
+    (define ord (next-ordinal!))
+    (define cell? (cell-ordinal? ord))
+    (define slot (alloc-local! stx (if cell? (cell-of ety) ety)))
+    (define tmp (and cell? (alloc-local! stx ety)))
+    (define-values (start end) (forms-span hforms))
+    (record-tooltip! e ety)
+    (record-scope! e (tui-type->string ety) start end)
+    (define-values (hty hcode)
+      (parameterize ([in-catch-handler #t])
+        (tc/bind (list (list e (if cell? 'cell 'local) slot ety ord))
+                 (syntax-property #`(tui-begin #,@hforms) 'tui-stmt #t))))
+    ; The exception object is on the stack. A cell is built from it through tmp, as in tui-let.
+    (define prefix
+      (if cell?
+          (append (list (var-instr 'st 'local tmp))
+                  (new-cell-code ety)
+                  (list (var-instr 'st 'local slot)
+                        (var-instr 'ld 'local slot)
+                        '(ldc.i4.0)
+                        (var-instr 'ld 'local tmp)
+                        `(stelem ,(tui-type->il ety))))
+          (list (var-instr 'st 'local slot))))
+    (handler-part owner prefix hty hcode))
+
+  (define handlers (for/list ([cc (in-list catches)]) (expand-catch cc)))
+
+  (define target
+    (if (eq? bty 'never)
+        (or (for/first ([h (in-list handlers)] #:unless (eq? (handler-part-type h) 'never))
+              (handler-part-type h))
+            'never)
+        bty))
+  (for ([h (in-list handlers)])
+    (define t (handler-part-type h))
+    (unless (or (eq? t 'never) (coercion t target))
+      (raise-syntax-error 'tui (format "catch handler has type ~a, but the try has type ~a"
+                                       (tui-type->string t) (tui-type->string target))
+                          stx)))
+  (define value? (not (memq target '(void never))))
+  (define r (and value? (alloc-local! stx target)))
+
+  (define fin-code
+    (cond
+      [finally?
+       (define-values (fty fcode)
+         (parameterize ([in-catch-handler #f])
+           (tc (syntax-property #`(tui-begin #,@fin-forms) 'tui-stmt #t))))
+       (unless (eq? fty 'void)
+         (raise-syntax-error 'tui (format "a finally body must be void, got ~a" (tui-type->string fty))
+                             (last clause-forms)))
+       fcode]
+      [else '()]))
+
+  (define (branch-code ty code)
+    (cond
+      [(eq? ty 'never) code]
+      [else
+       (append code
+               (cdr (coercion ty target))
+               (if value? (list (var-instr 'st 'local r)) '())
+               (list `(leave ,after-catch)))]))
+
+  (define ots (and finally? (fresh-label! stx 'tryfinally)))
+  (define ote (and finally? (fresh-label! stx 'endtryfinally)))
+  (define fhs (and finally? (fresh-label! stx 'finallyhandler)))
+  (define fhe (and finally? (fresh-label! stx 'endfinallyhandler)))
+  (define ts (fresh-label! stx 'trybody))
+  (define te (fresh-label! stx 'endtrybody))
+  (define after-catch (fresh-label! stx 'endtry))
+  (define after-all (and finally? (fresh-label! stx 'endtryall)))
+  (define hs-labels (for/list ([h (in-list handlers)]) (fresh-label! stx 'catchhandler)))
+  (define he-labels (for/list ([h (in-list handlers)]) (fresh-label! stx 'endcatchhandler)))
+
+  (define code
+    (append
+     (if finally? (list `(label ,ots)) '())
+     (list `(label ,ts))
+     (branch-code bty bcode)
+     (list `(label ,te))
+     (append*
+      (for/list ([h (in-list handlers)] [hs (in-list hs-labels)] [he (in-list he-labels)])
+        (append (list `(label ,hs))
+                (handler-part-prefix h)
+                (branch-code (handler-part-type h) (handler-part-code h))
+                (list `(label ,he)))))
+     (list `(label ,after-catch))
+     (if finally?
+         (append `((leave ,after-all) (label ,ote) (label ,fhs))
+                 fin-code
+                 `((endfinally) (label ,fhe) (label ,after-all)))
+         '())
+     (if value? (list (var-instr 'ld 'local r)) '())
+     (for/list ([h (in-list handlers)] [hs (in-list hs-labels)] [he (in-list he-labels)])
+       `(.try (catch ,(handler-part-owner h)) ,ts ,te ,hs ,he))
+     (if finally? (list `(.try (finally) ,ots ,ote ,fhs ,fhe)) '())))
+
+  (il target code))
 
 (define-tui-form (tui-and stx)
   (syntax-parse stx

@@ -28,7 +28,7 @@ section 11 for the exact IL forms.
 | `private/meta-server.rkt` | The editor helper: JSON lines on stdio for scopes, names, types and members. See section 4. |
 | `private/type-patterns.rkt` | Type-pattern runtime (phase 0): the solver, the named-pattern registry and `match-type-pattern`. See section 12.1. |
 | `private/type-syntax-class.rkt` | Type-pattern compiler: `define-type-syntax-class`, `type-match` and `type-matches?`. See section 12.1. |
-| `tests/tui-test.rkt` | The test suite (29 tests, about 4 minutes). |
+| `tests/tui-test.rkt` | The test suite (79 tests, about 4 minutes). |
 | `tests/meta-server-test.rkt` | Tests for the editor helper's requests, in process. |
 | `editors/vscode-tui/` | The VS Code companion: completion and Browse Members, through the helper. See section 4. |
 | `examples/` | Runnable programs. Each one is covered by a test. See section 12. |
@@ -735,6 +735,24 @@ Common messages (the exact wording is in `main.rkt` and `private/clr.rkt`):
 - `null? needs a value, not a bare null`, `null? needs a reference type, got X`
 - `cannot compare X with null`, `cannot compare null with null` (`=` with a null operand)
 - `ambiguous call to X with (null)` (a bare `null` argument that more than one overload accepts)
+- `try must be a statement; its value would be on the evaluation stack here` (a `try` inside an argument, operand, `set!` or `new`; see the exceptions note below)
+- `try needs a body`, `try needs a catch or finally clause`, `expected a catch or finally clause`
+- `finally must be the last clause of try`, `a catch-all clause must be the last catch clause`
+- `catch needs an exception type, got X`, `cannot catch X` (a type defined in this assembly, or a generic type)
+- `catch handler has type X, but the try has type Y`, `a finally body must be void, got X`
+- `throw needs an exception, got X`, `rethrow is only allowed in a catch handler`
+- `cannot bind a value that never completes`, `cannot assign a value that never completes` (a `never` expression, such as `throw`, used as a value)
+
+Exceptions. `try` has three clauses: `(catch [e : T] body ...)` for one type, `(catch e body ...)`
+for any exception (it must come last), and `(finally body ...)`, which must be void and come last.
+The try's type is the body's type, and each handler must match it. A handler that ends in `throw`
+or `rethrow` has type `never`, which fits any type and emits no store. `never` is only produced by
+expressions and cannot be written as an annotation. `try` is only allowed where the IL evaluation
+stack is empty: a function or lambda body, a module initializer, and the statement positions inside
+them (`begin`, `let` body, `if` branches, `while`, `for-each`). The compiler marks those positions
+with the `'tui-stmt` syntax property, so `try` in an argument is rejected. The handler's exception
+variable is an ordinary local, or a cell if a lambda reads it. `rethrow` is only allowed directly in
+a handler; a lambda inside a handler is a separate method and cannot rethrow the outer exception.
 
 ## 15. Tests
 
@@ -793,6 +811,7 @@ and run `raco make main.rkt`.
 | `records.rkt` | record declarations: constructor, `get_`/`set_` properties, `set!` on a field, a record field of a record type, type-syntax-classes that name `Point` or match it structurally, and `type-match` on a record | `a record has a constructor, get_ and set_ properties, and can be passed and returned` |
 | `arrays.rkt` | array literals, `new-array`, `aref` read and write, `for-each` over arrays, jagged arrays, `IEnumerable<T>`, strings and closures, `Length`, `Enumerable.Contains` | `arrays: literals, new-array, aref, for-each over arrays, IEnumerable and strings` |
 | `enums.rkt` | enum parameters and members, `=` on enums, a module value of an enum type, `Int32.MaxValue`, a literal field, `Math.PI` | `enum members and static fields are read by qualified name` |
+| `exceptions.rkt` | `try` with typed and catch-all handlers, `finally`, `throw`, `rethrow`, `try` in a `let` inside a function, a checked division that returns `never` on the error path | `the exceptions example runs`, plus the `try, throw and rethrow` tests |
 
 ## 17. Known limits
 
@@ -832,5 +851,9 @@ and run `raco make main.rkt`.
 - Array covariance is not modeled. An array of a derived type does not convert to an array of its base
   type.
 - A named pattern exported from one module and used from another has not been tested.
+- `try` is statement-only. A `try` inside an argument, operand, `new` or `set!` value is rejected, because the IL `.try` block needs an empty evaluation stack. Hoist it into a `let` to use its value.
+- A `catch` cannot name an exception type defined in the assembly being built, or a generic type. Use a library exception type.
+- A `finally` body must be void. It cannot produce a value.
+- `never` cannot be written as an annotation, so a `define` that always throws must declare its real return type.
 - Captured cells use one array per variable. Grouping captures into one object would reduce
   allocations; see [captures.md](captures.md) section 9.

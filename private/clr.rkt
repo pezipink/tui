@@ -319,6 +319,8 @@
 (define (coercion from to)
   (cond
     [(equal? from to) '(0)]
+    ; never (see tui-throw) completes no value, so it converts to anything without code
+    [(eq? from 'never) '(0)]
     ; object costs more than a base class or interface, so List<T> prefers IEnumerable<T> to object
     [(and (eq? to 'object) (not (value-type? from)) (not (eq? from 'void))) '(2)]
     [(and (eq? to 'object) (value-type? from)) `(2 (box ,(tui-type->il from)))]

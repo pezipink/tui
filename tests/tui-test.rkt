@@ -833,6 +833,89 @@
                          '(Console.WriteLine (f 4)))
                 '("1")))
 
+(test-case "the exceptions example runs"
+  (check-equal? (run-example "exceptions.rkt")
+                '("2" "checked" "b is zero" "checked" "42" "not a number" "-1"
+                  "5" "logging" "outer caught")))
+
+(test-case "try catches typed and catch-all handlers and yields the value of the body or a handler"
+  (check-equal? (run-tui '(define (safe [n : int]) : int
+                            (try (if (< n 0) (throw (new System.ArgumentException "neg")) n)
+                                 (catch [e : System.ArgumentException] 0)))
+                         '(Console.WriteLine (safe 3))
+                         '(Console.WriteLine (safe -1)))
+                '("3" "0"))
+  (check-equal? (run-tui '(define (f [n : int]) : int
+                            (try (if (< n 0) (throw (new System.Exception "x")) n)
+                                 (catch e 7)))
+                         '(Console.WriteLine (f -1)))
+                '("7"))
+  (check-equal? (run-tui '(define (g [n : int]) : int
+                            (let ([x (try (if (< n 0) (throw (new System.Exception "x")) n)
+                                          (catch [e : System.Exception] 5))])
+                              (+ x 1)))
+                         '(Console.WriteLine (g -1))
+                         '(Console.WriteLine (g 1)))
+                '("6" "2")))
+
+(test-case "finally runs on the normal path and when the exception leaves the try"
+  (define defs
+    '((define (f [n : int]) : void
+        (try (if (< n 0) (throw (new System.Exception "x")) (Console.WriteLine "body"))
+             (finally (Console.WriteLine "finally"))))))
+  (check-equal? (apply run-tui (append defs '((f 1))))
+                '("body" "finally"))
+  (check-equal? (apply run-tui (append defs '((try (f -1) (catch e (Console.WriteLine "outer"))))))
+                '("finally" "outer")))
+
+(test-case "rethrow passes the exception of a catch handler to an outer try"
+  (check-equal? (run-tui '(try
+                            (try (throw (new System.InvalidOperationException "inner"))
+                                 (catch [e : System.InvalidOperationException]
+                                   (Console.WriteLine "first")
+                                   (rethrow)))
+                            (catch [e : System.Exception] (Console.WriteLine "outer"))))
+                '("first" "outer")))
+
+(test-case "handler variables are cells when a lambda reads them"
+  (check-equal? (run-tui '(try (throw (new System.Exception "boom"))
+                               (catch [e : System.Exception]
+                                 (Console.WriteLine (.Invoke (fn () (.get_Message e)))))))
+                '("boom")))
+
+(test-case "a try in a let body inside a function, and a lambda in a try body, run"
+  (check-equal? (run-tui '(define (h [n : int]) : void
+                            (let ([x 5])
+                              (try (if (< n 0) (throw (new System.Exception "x")) (Console.WriteLine x))
+                                   (catch [e : System.Exception] (Console.WriteLine "caught")))))
+                         '(h 1)
+                         '(h -1)
+                         '(try (Console.WriteLine (.Invoke (fn () 9)))
+                               (catch e (Console.WriteLine "top"))))
+                '("5" "caught" "9")))
+
+(test-case "try, throw and rethrow are checked at expansion time"
+  (check-regexp-match #rx"try must be a statement"
+                      (tui-error '(Console.WriteLine (try 1 (catch [e : System.Exception] 2)))))
+  (check-regexp-match #rx"throw needs an exception, got int32" (tui-error '(throw 1)))
+  (check-regexp-match #rx"rethrow is only allowed in a catch handler" (tui-error '(rethrow)))
+  (check-regexp-match #rx"rethrow is only allowed in a catch handler"
+                      (tui-error '(try 1 (finally (rethrow)))))
+  (check-regexp-match #rx"try needs a body" (tui-error '(try (catch [e : System.Exception] 1))))
+  (check-regexp-match #rx"try needs a catch or finally clause" (tui-error '(try 1)))
+  (check-regexp-match #rx"a catch-all clause must be the last catch clause"
+                      (tui-error '(try 1 (catch e 2) (catch [x : System.Exception] 3))))
+  (check-regexp-match #rx"finally must be the last clause of try"
+                      (tui-error '(try 1 (finally (Console.WriteLine "f")) (catch [x : System.Exception] 3))))
+  (check-regexp-match #rx"catch needs an exception type, got int32"
+                      (tui-error '(try 1 (catch [x : int] 2))))
+  (check-regexp-match #rx"catch handler has type string, but the try has type int32"
+                      (tui-error '(define (f) : int (try 1 (catch [x : System.Exception] "s")))))
+  (check-regexp-match #rx"a finally body must be void, got int32"
+                      (tui-error '(try 1 (catch [x : System.Exception] 2) (finally 3))))
+  (check-regexp-match #rx"cannot bind a value that never completes"
+                      (tui-error '(let ([x (throw (new System.Exception "x"))]) x))))
+
 (test-case "an inferred module value cannot use a later value or be void"
   (check-regexp-match #rx"module value used before it is defined"
                       (tui-error '(define a (+ b 1)) '(define b : int 1)))
