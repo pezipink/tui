@@ -19,6 +19,9 @@ compiler's own expansion and from CLR metadata, through the editor helper
 - **Tui: Browse Members.** A command that asks for a value or type, then for one of its members, and
   inserts the member at the cursor. Methods with arguments insert a call with a snippet stop for the
   first argument.
+- **Debugging.** A `tui` launch configuration builds a `.tui` file to an exe with its PDB, then
+  starts the exe under the C# extension's `clr` debugger. Breakpoints are set on statements in the
+  `.tui` file.
 
 Documents that are not `#lang tui` get nothing from this extension, so racket-langserver and
 Magic Racket answer them as before.
@@ -28,14 +31,33 @@ Magic Racket answer them as before.
 The extension runs `racket private/meta-server.rkt` from the Tui repository. It needs `racket` on
 the path, and Tui's own dependencies installed.
 
+Debugging needs the C# extension (`ms-dotnettools.csharp`), which the extension installs with it.
+The program is a .NET Framework 4.x exe, so it runs on Windows.
+
 Settings:
 
 - `tui.metaServerPath`: the path to `private/meta-server.rkt`. If empty, the extension looks in the
-  workspace folders for it.
+  workspace folders for it. Debugging finds the build script (`build.rkt`) from the same path.
 - `tui.racketPath`: the `racket` executable. Defaults to `racket`.
 
 The helper starts the first time a Tui module asks for completion. Its output goes to the **Tui**
-channel in the Output panel.
+channel in the Output panel. Build output for debugging goes there too.
+
+### Debugging a program
+
+Open a `.tui` file, and choose **Debug Tui program** from the Run and Debug view (or add the
+configuration from `launch.json`). The launch configuration takes:
+
+- `source`: the `.tui` file to build. Defaults to the active editor (`${file}`).
+- `args`: command-line arguments for the program.
+- `console`: `internalConsole`, `integratedTerminal` or `externalTerminal`.
+- `stopAtEntry`: stop on the first line of the program.
+
+The exe and its PDB are written under the OS temp directory (`tui-debug`), one pair per source file.
+Compile errors are shown in an error message, and the session does not start. The exe is a 64-bit
+program, since the .NET Framework debugger only attaches to 64-bit processes. Parameters and locals
+appear in the Variables view under their source names. Compiler temporaries appear without a name.
+
 
 ## Development
 
@@ -44,7 +66,7 @@ separate install. Its tests use Node's test runner. To run them with the Node th
 
 ```powershell
 $env:ELECTRON_RUN_AS_NODE = 1
-& "C:\path\to\Microsoft VS Code\Code.exe" --test test/syntax.test.js test/helper.test.js test/completion.test.js test/extension.test.js
+& "C:\path\to\Microsoft VS Code\Code.exe" --test test/syntax.test.js test/helper.test.js test/completion.test.js test/debug.test.js test/extension.test.js
 ```
 
 With a Node installation, `npm test` runs the same files. The helper tests need `racket` on the path

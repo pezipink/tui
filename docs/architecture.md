@@ -58,6 +58,35 @@ For a file `m.rkt` written in `#lang tui`:
 6. **Run.** `run-tui-program` assembles the program with Rangi and runs it. `racket m.rkt` runs the
    `main` submodule. `tui-write-exe` writes the `.exe` without running it.
 
+### Line markers and the PDB
+
+Each statement of a function body and of the entry point is preceded by a Rangi `.line` directive
+that gives its source span. Rangi writes these into the PDB beside the exe, so a debugger can map
+IL offsets to lines of the `.tui` file.
+
+- The span comes from the statement's `syntax-position` and `syntax-span`. Racket counts a `\r\n`
+  pair as one position, so `record-line-source!` normalizes line endings before it computes the
+  line starts. Columns are 0-based character counts. Lines are 1-based.
+- Only statements written in the file get a marker. `syntax-original?` is false for everything a
+  Tui form expands to, so the test is whether the position lies inside a compiled module-level form
+  from the same file. A statement that a macro template produces has template positions and no
+  marker.
+- Named locals and parameters are written too. A parameter's name is a `(param () TYPE NAME)` entry
+  in the method signature, and a local's name is a `(TYPE NAME)` entry in `.locals`. Lets, catch
+  variables and captured-argument cells use the user's name. Compiler temporaries stay unnamed.
+  Rangi requires unique local names per method, so a shadowed name gets a suffix (`acc_1`).
+- `tui-program->il` declares the image `.format pe32+`, so it is an AMD64 exe. The .NET Framework
+  debugger only attaches to x64 processes, and the exes therefore do not run on 32-bit Windows. It
+  also adds an assembly-level `DebuggableAttribute` with the JIT tracking and optimizations
+  disabled, so locals stay alive and Just My Code can step into the code.
+- The REPL emits no markers, since it has no module.
+- The `.line` file name is the source's absolute path, so the PDB, and so the exe's bytes, depend on
+  where the repository is.
+- `run-tui-main` deletes the PDB with the temporary exe.
+
+`build.rkt` writes the exe and its PDB, and the VS Code debug provider uses it (section 4, the VS
+Code companion).
+
 ## 4. Typed fragments and the `tc` contract
 
 Every Tui expression expands to `(tui-il (type instructions))`, a datum wrapped in syntax:
@@ -169,6 +198,9 @@ The plan called for TypeScript; this was chosen because the repository has no No
   the visible values and the opened arity-0 types, ranked ahead of racket-langserver's name-only list.
 - `lib/browse.js` is the `Tui: Browse Members` command. It asks for a value or type, then a member,
   and inserts the member in the dotted form the compiler reads.
+- `lib/debug.js` holds the pure parts of debugging: the exe path, the `build.rkt` arguments, and the
+  launch configuration. The `tui` debug type builds the source with `build.rkt` into the OS temp
+  directory, then returns a `clr` launch for the exe, which the C# extension runs with its PDB.
 
 `extension.js` wires these up. The tests in `editors/vscode-tui/test` run under VS Code's
 Electron in Node mode, with a stand-in `vscode` module and the real helper. The extension host
@@ -539,6 +571,7 @@ Tui generates ilasm datums and Rangi assembles them. The forms this repository d
 | module field declaration | `(.field (public static) type name)` |
 | static call | `(call ret (Program) name (params))` |
 | constructed type operand | TypeSpec token (Rangi commit `f84aa29`, "Emit TypeSpec tokens for constructed operands") |
+| source line | `(.line l1 c1 l2 c2 "file")`, 1-based lines, columns 0..#xFFFF (Rangi writes the PDB) |
 
 `Program` is how Rangi names the `<Module>` class. Rangi moves the module's static methods into
 `Program`, so Tui code refers to `Program`, not `<Module>`.
@@ -820,6 +853,10 @@ and run `raco make main.rkt`.
 - Hover is checked through racket-langserver only, not in the DrRacket GUI.
 - Hover and the scope table are not built for half-typed buffers. A failed expansion leaves the last good table in place, and the metadata helper answers from it. Completion at the cursor can therefore be a few edits out of date.
 - The metadata helper's offsets are character offsets. Editors that count UTF-16 units (VS Code) disagree with them after an astral-plane character.
+- Debugging in VS Code: breakpoints, stepping and return values have been checked in the Extension
+  Development Host. Locals and parameters are now named in the PDB and need that check too.
+  Compiler temporaries show without names, and a captured variable shows as the one-element array
+  that holds it.
 - The VS Code companion cannot browse generic types, since their type arguments are not known. They are reached through a value of the type. Member completion inserts names only, not argument lists.
 - The metadata helper keeps a snapshot for every file it has been sent and has no close request, so it holds on to closed files until it exits.
 - Inference is limited to exact `(mvar n)` parameters, base-type matches of generic instance

@@ -91,4 +91,4 @@ function startClient() {
   return { client, service: new TuiService(client) };
 }
 
-module.exports = { SERVER, racketAvailable, fakeVscode, makeDocument, startClient, labelOf };
+module.exports = { SERVER, REPO_ROOT, racketAvailable, fakeVscode, makeDocument, startClient, labelOf };

@@ -431,6 +431,106 @@
   (check-equal? (file->bytes pa) (file->bytes pb))
   (delete-directory/files dir))
 
+; Writes src to a file in a fresh temp directory, and returns the path.
+(define (write-module src-text)
+  (define dir (make-temporary-directory "tui-src-~a"))
+  (define src (build-path dir "prog.rkt"))
+  (display-to-file src-text src)
+  (values dir src))
+
+; The (line column end-line end-column file) of each .line directive in a program's instructions.
+(define (line-directives p)
+  (let find ([d (list (tui-program-methods p) (tui-program-main p))])
+    (cond
+      [(and (pair? d) (eq? (car d) '.line))
+       (list (list (list-ref d 1) (list-ref d 2) (list-ref d 3) (list-ref d 4) (list-ref d 5)))]
+      [(pair? d) (append (find (car d)) (find (cdr d)))]
+      [else '()])))
+
+(define line-program-text
+  "#lang tui
+(define (add [a : int] [b : int]) : int
+  (+ a
+     b))
+(define (twice [x : int]) : int
+  (let ([y (add x x)])
+    (Console.WriteLine y)
+    y))
+(Console.WriteLine (twice 4))
+")
+
+(test-case "statements carry .line directives with their source spans, with CRLF or LF line ends"
+  (for ([crlf? (in-list '(#t #f))])
+    (define-values (dir src)
+      (write-module (if crlf?
+                        (string-replace line-program-text "\n" "\r\n")
+                        line-program-text)))
+    (define p (dynamic-require src 'tui-program))
+    (define file (path->string src))
+    (check-equal? (sort (line-directives p) < #:key car)
+                  `((3 2 4 7 ,file) (6 2 8 6 ,file) (7 4 7 25 ,file)
+                    (8 4 8 5 ,file) (9 0 9 29 ,file)))
+    (delete-directory/files dir)))
+
+(test-case "statements from a macro template get no .line directive"
+  (define-values (dir src)
+    (write-module "#lang tui
+(define-syntax-rule (show x) (Console.WriteLine x))
+(show 4)
+(Console.WriteLine 5)
+"))
+  (define p (dynamic-require src 'tui-program))
+  (define ds (line-directives p))
+  ; the template is on line 2, and no directive may point at it
+  (check-false (for/or ([d (in-list ds)]) (= (car d) 2)))
+  ; a plain statement next to it still gets one
+  (check-true (for/or ([d (in-list ds)]) (equal? (car d) 4)))
+  (delete-directory/files dir))
+
+(test-case "tui-write-exe writes a PDB beside the exe"
+  (define p (dynamic-require (build-path examples "basics.rkt") 'tui-program))
+  (define dir (make-temporary-directory "tui-pdb-~a"))
+  (define exe (build-path dir "pdb.exe"))
+  (tui-write-exe p exe)
+  (define pdb (path-replace-extension exe #".pdb"))
+  (check-true (file-exists? pdb))
+  (check-true (> (file-size pdb) 0))
+  (delete-directory/files dir))
+
+(test-case "tui-write-exe builds an x64 PE32+ image with a debuggable attribute"
+  (define p (dynamic-require (build-path examples "basics.rkt") 'tui-program))
+  (define dir (make-temporary-directory "tui-x64-~a"))
+  (define exe (build-path dir "x64.exe"))
+  (tui-write-exe p exe)
+  (define bs (file->bytes exe))
+  (define pe (integer-bytes->integer bs #f #f #x3C #x40))
+  (check-equal? (integer-bytes->integer bs #f #f (+ pe 4) (+ pe 6)) #x8664 "machine is AMD64")
+  (check-equal? (integer-bytes->integer bs #f #f (+ pe 24) (+ pe 26)) #x20B "optional header is PE32+")
+  (check-true (regexp-match? #rx#"DebuggableAttribute" bs) "DebuggableAttribute is referenced")
+  (delete-directory/files dir))
+
+; The metadata strings are NUL-terminated, so a name matches as \0name\0.
+(test-case "parameters, locals and catch variables keep their names, and shadowed names get a suffix"
+  (define-values (dir src)
+    (write-module "#lang tui
+(define (f [n : int]) : int
+  (let ([acc 1])
+    (let ([acc (+ acc n)])
+      (try acc
+        (catch [e : System.Exception] 0)))))
+(Console.WriteLine (f 2))
+"))
+  (define p (dynamic-require src 'tui-program))
+  (define exe (build-path dir "names.exe"))
+  (tui-write-exe p exe)
+  (define pdb (file->bytes (path-replace-extension exe #".pdb")))
+  (define bs (file->bytes exe))
+  (check-true (regexp-match? #rx#"\0n\0" bs) "parameter n is named in the exe")
+  (check-true (regexp-match? #rx#"\0acc\0" pdb) "local acc is named in the PDB")
+  (check-true (regexp-match? #rx#"\0acc_1\0" pdb) "shadowed acc is suffixed")
+  (check-true (regexp-match? #rx#"\0e\0" pdb) "catch variable e is named in the PDB")
+  (delete-directory/files dir))
+
 (test-case "fn builds delegates for Action, Func and Predicate"
   (check-equal? (run-example "delegates.rkt")
                 '("10" "20" "30" "1" "2" "42" "81" "6" "from fn" "no args")))

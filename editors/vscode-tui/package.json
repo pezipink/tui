@@ -13,15 +13,73 @@
     "Programming Languages"
   ],
   "main": "./extension.js",
+  "extensionDependencies": [
+    "ms-dotnettools.csharp"
+  ],
   "activationEvents": [
     "onLanguage:racket",
-    "onCommand:tui.browse"
+    "onCommand:tui.browse",
+    "onDebugResolve:tui"
   ],
   "contributes": {
     "commands": [
       {
         "command": "tui.browse",
         "title": "Tui: Browse Members"
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "racket"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "tui",
+        "label": "Tui",
+        "languages": [
+          "racket"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "source": {
+                "type": "string",
+                "description": "The .tui file to build and debug. Defaults to the active editor.",
+                "default": "${file}"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Command-line arguments for the program.",
+                "default": []
+              },
+              "console": {
+                "type": "string",
+                "enum": [
+                  "internalConsole",
+                  "integratedTerminal",
+                  "externalTerminal"
+                ],
+                "default": "internalConsole"
+              },
+              "stopAtEntry": {
+                "type": "boolean",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "name": "Debug Tui program",
+            "type": "tui",
+            "request": "launch",
+            "source": "${file}"
+          }
+        ]
       }
     ],
     "configuration": {
@@ -41,6 +99,6 @@
     }
   },
   "scripts": {
-    "test": "node --test test/syntax.test.js test/helper.test.js test/completion.test.js test/extension.test.js"
+    "test": "node --test test/syntax.test.js test/helper.test.js test/completion.test.js test/debug.test.js test/extension.test.js"
   }
 }

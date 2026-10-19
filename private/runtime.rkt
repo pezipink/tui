@@ -34,6 +34,13 @@
 (define (tui-program->il p name [main (tui-program-main p)])
   `(,@(for/list ([r (in-list (tui-program-references p))]) `(.assembly extern ,r ,(extern-body r)))
     (.assembly ,name ())
+    ; PE32+ (machine AMD64). The default PE32 image is I386, which the .NET Framework debugger
+    ; refuses to attach to as a non-x64 process.
+    (.format pe32+)
+    ; DebuggableAttribute(isJITTrackingEnabled = true, isJITOptimizerDisabled = true). Without it
+    ; the JIT optimizes the program and the debugger's Just My Code skips its symbols.
+    (.custom (mscorlib System.Diagnostics.DebuggableAttribute) .ctor void (boolean boolean)
+             = (bytearray (01 00 01 01 00 00)))
     (.module ,(string->symbol (format "~a.exe" name)))
     ,@(tui-program-classes p)
     (.class (private auto ansi) <Module>
@@ -64,7 +71,7 @@
   path)
 
 ; Assembles into a fresh temp file, runs it with stdout and stderr copied to the current ports,
-; then deletes it. Raises if the program exits with a non-zero code.
+; then deletes it and its PDB. Raises if the program exits with a non-zero code.
 (define (run-tui-main p main)
   (define exe (make-temporary-file "tui-~a.exe"))
   (dynamic-wind
@@ -77,7 +84,9 @@
      (define code (system*/exit-code exe))
      (unless (zero? code)
        (error 'tui "program exited with code ~a" code)))
-   (λ () (delete-soon exe))))
+   (λ ()
+     (delete-soon exe)
+     (delete-soon (path-replace-extension exe #".pdb")))))
 
 ; Windows (the loader or a virus scanner) can hold an exe briefly after its process exits, so
 ; deletion is retried for up to a second; a file still locked after that is left in temp.

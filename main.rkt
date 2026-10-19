@@ -5,7 +5,7 @@
 ; internal definition contexts, so hygiene and define-syntax-rule macros work unchanged. Calls to
 ; .NET are resolved at expansion time by reading the referenced assemblies with Rangi's reader.
 ; The module's program is kept as ilasm datums, assembled with Rangi when it runs.
-(require (for-syntax racket/base racket/list racket/string syntax/parse syntax/parse/define
+(require (for-syntax racket/base racket/file racket/list racket/string syntax/parse syntax/parse/define
                      "private/clr.rkt" "private/type-patterns.rkt"
                      "private/type-syntax-class.rkt")
          syntax/parse/define
@@ -83,7 +83,8 @@
   ; Per-method state: local variable types (in slot order) and a label counter. parent is the
   ; enclosing method of a lambda. env lists the (variable . local) pairs that a lambda reads from
   ; its class fields.
-  (struct mctx ([locals #:mutable] [labels #:mutable] parent [env #:mutable]))
+  ; names is parallel to locals: the source name of each local, or #f for a compiler temporary.
+  (struct mctx ([locals #:mutable] [names #:mutable] [labels #:mutable] parent [env #:mutable]))
   (struct cell-of (type))
   (define current-mctx (make-parameter #f))
 
@@ -123,16 +124,26 @@
   (define (the-mctx stx)
     (or (current-mctx) (raise-syntax-error 'tui "Tui expression outside a method body" stx)))
 
-  (define (alloc-local! stx ty) (alloc-local-in! (the-mctx stx) ty))
+  (define (alloc-local! stx ty [name #f]) (alloc-local-in! (the-mctx stx) ty name))
 
   (define (new-cell-code ty) (list '(ldc.i4.1) `(newarr ,(tui-type->il ty))))
 
-  (define (alloc-local-in! m ty)
+  ; Rangi requires local names to be unique within a method, but Tui allows shadowing, so a repeated
+  ; name gets a numeric suffix.
+  (define (unique-local-name m name)
+    (and name
+         (let loop ([k 1] [cand name])
+           (if (member cand (mctx-names m))
+               (loop (add1 k) (string->symbol (format "~a_~a" name k)))
+               cand))))
+
+  (define (alloc-local-in! m ty [name #f])
     (define i (length (mctx-locals m)))
     (set-mctx-locals! m (append (mctx-locals m) (list ty)))
+    (set-mctx-names! m (append (mctx-names m) (list (unique-local-name m name))))
     i)
 
-  (define (new-mctx parent) (mctx '() 0 parent '()))
+  (define (new-mctx parent) (mctx '() '() 0 parent '()))
 
   (define (fresh-label! stx base)
     (define m (the-mctx stx))
@@ -202,6 +213,68 @@
         (values #f #f)
         (values (apply min (map syntax-position ps))
                 (apply max (map (λ (f) (+ (syntax-position f) (syntax-span f))) ps)))))
+
+  ; Debug line markers. A statement of a compiled module-level form gets a .line directive for its
+  ; source span, so the PDB maps its code to the source. A statement from a macro template keeps the
+  ; template's position, which is outside the module's compiled forms (the template is in a macro
+  ; definition, or in another file), so it gets no marker. For each source file, the line starts
+  ; and the 1-based spans of the compiled forms are recorded when the module is expanded.
+  (struct line-source (starts spans))
+  (define line-sources (make-hash))
+
+  (define (record-line-source! src forms)
+    (hash-remove! line-sources src)
+    ; The reader's positions count a \r\n pair as one character, so the text is normalized the same way.
+    (define text (and (path? src)
+                      (with-handlers ([exn:fail:filesystem? (λ (e) #f)])
+                        (regexp-replace* #rx"\r\n" (file->string src) "\n"))))
+    (when text
+      (define spans
+        (for/list ([f (in-list forms)] #:when (and (syntax-position f) (> (syntax-span f) 0)))
+          (cons (syntax-position f) (+ (syntax-position f) (syntax-span f)))))
+      (hash-set! line-sources src (line-source (line-starts text) spans))))
+
+  ; The 0-based offset of the first character of each line. A line break is \n, \r\n, or a lone \r.
+  (define (line-starts text)
+    (define n (string-length text))
+    (list->vector
+     (cons 0
+           (for/list ([i (in-range n)]
+                      #:when (let ([c (string-ref text i)])
+                               (or (char=? c #\newline)
+                                   (and (char=? c #\return)
+                                        (not (and (< (add1 i) n)
+                                                  (char=? (string-ref text (add1 i)) #\newline)))))))
+             (add1 i)))))
+
+  ; The 1-based line and 0-based column of a 0-based offset.
+  (define (offset-line+column starts o)
+    (let search ([lo 0] [hi (sub1 (vector-length starts))])
+      (cond
+        [(= lo hi) (values (add1 lo) (- o (vector-ref starts lo)))]
+        [else
+         (define mid (quotient (+ lo hi 1) 2))
+         (if (<= (vector-ref starts mid) o)
+             (search mid hi)
+             (search lo (sub1 mid)))])))
+
+  ; The .line directive for the source span of stx, as a list of zero or one instruction. The list is
+  ; empty unless stx lies in a compiled form of its module, or its columns do not fit in Rangi.
+  (define (line-marker stx)
+    (define src (syntax-source stx))
+    (define ls (and (path? src) (hash-ref line-sources src #f)))
+    (define p (syntax-position stx))
+    (cond
+      [(and ls p (> (syntax-span stx) 0)
+            (for/or ([sp (in-list (line-source-spans ls))]) (and (<= (car sp) p) (< p (cdr sp)))))
+       (define starts (line-source-starts ls))
+       (define-values (l1 c1) (offset-line+column starts (sub1 p)))
+       ; the end is the column after the last character
+       (define-values (l2 c2) (offset-line+column starts (+ p (syntax-span stx) -2)))
+       (if (and (<= c1 #xFFFF) (<= (add1 c2) #xFFFF))
+           (list `(.line ,l1 ,c1 ,l2 ,(add1 c2) ,(path->string src)))
+           '())]
+      [else '()]))
 
   ; Expands stx to a typed fragment: (values type instructions). origin is the source syntax
   ; that the type is recorded for, when stx is already expanded and has lost its location.
@@ -598,7 +671,7 @@
           (record-scope! id (tui-type->string ty) body-start body-end)
           (cond
             [(and (eq? kind 'arg) (cell-ordinal? ord))
-             (define j (alloc-local-in! m (cell-of ty)))
+             (define j (alloc-local-in! m (cell-of ty) (syntax-e id)))
              (values (cons (list id 'cell j ty ord) bs)
                      (cons (append (new-cell-code ty)
                                    (list (var-instr 'st 'local j)
@@ -636,8 +709,17 @@
   (define (local-il t)
     (if (cell-of? t) `(szarray ,(tui-type->il (cell-of-type t))) (tui-type->il t)))
 
-  (define (locals-decl locals)
-    (if (null? locals) '() `((.locals init ,(map local-il locals)))))
+  (define (locals-decl m)
+    (define entries
+      (for/list ([t (in-list (mctx-locals m))] [n (in-list (mctx-names m))])
+        (if n `(,(local-il t) ,n) (local-il t))))
+    (if (null? entries) '() `((.locals init ,entries))))
+
+  ; Parameter declarations with names, so the debugger can show them. The call signature is
+  ; unchanged, so callers still use the plain types.
+  (define (params-decl tys names)
+    (for/list ([t (in-list tys)] [n (in-list names)])
+      `(param () ,(tui-type->il t) ,(syntax-e n))))
 
   (define (compile-function def)
     (define-values (name pnames ptypes ret body) (fun-header def))
@@ -652,9 +734,9 @@
        (λ ()
          (compile-body def (for/list ([p pnames] [t ptys] [i (in-naturals)]) (list p 'arg i t))
                        body rty #f #f))))
-      `(.method (public static) ,(tui-type->il rty) ,(syntax-e name) ,(map tui-type->il ptys)
+      `(.method (public static) ,(tui-type->il rty) ,(syntax-e name) ,(params-decl ptys pnames)
                 (cil managed)
-                (,@(locals-decl (mctx-locals m)) ,@code)))
+                (,@(locals-decl m) ,@code)))
 
   ; A module value (define name : T expr). The field is a static field of <Module>, and the static
   ; method __init_name computes the value. earlier lists the values that are set before this one.
@@ -672,7 +754,7 @@
               (compile-body def '() (list #'e) rty #f #f)))))
        (values `(.method (public static) ,(tui-type->il rty) ,(value-init-name (syntax-e #'name))
                          () (cil managed)
-                         (,@(locals-decl (mctx-locals m)) ,@code))
+                         (,@(locals-decl m) ,@code))
                `(.field (public static) ,(tui-type->il rty) ,(syntax-e #'name)))]
       [_ (raise-syntax-error 'tui "expected (define name [: type] expr)" def)]))
 
@@ -813,8 +895,8 @@
             '(.method (public specialname rtspecialname) void .ctor () (cil managed)
                       ((ldarg.0) (call void (mscorlib System.Object) .ctor ()) (ret))))
           (define invoke
-            `(.method (public) ,ret-il Invoke ,ils (cil managed)
-                      (,@(locals-decl (mctx-locals m)) ,@code)))
+            `(.method (public) ,ret-il Invoke ,(params-decl ptys pnames) (cil managed)
+                      (,@(locals-decl m) ,@code)))
           (define class-datum `(.class (public auto ansi) ,cname (,@fields ,ctor ,invoke)))
           (set-box! lifted-classes
                     (cons (syntax-local-lift-expression
@@ -849,7 +931,7 @@
 
   ; The entry point. With print? the value of the last form, if any, is written to the console.
   (define (compile-main stx forms print? [inits '()])
-    (define-values (code locals)
+    (define-values (code m)
       (run-passes
        (λ ()
          (parameterize ([current-mctx (new-mctx #f)])
@@ -864,9 +946,9 @@
                                                         (list ty) "Console.WriteLine")))])
                          (append (car convs) (list (clr-call-instr 'call m))))]
                [else '((pop))]))
-           (values (append code tail '((ret))) (mctx-locals (current-mctx)))))))
+           (values (append code tail '((ret))) (current-mctx))))))
     `(.method (public static) void __tui_main () (cil managed)
-              ((.entrypoint) ,@(locals-decl locals) ,@(value-inits inits) ,@code)))
+              ((.entrypoint) ,@(locals-decl m) ,@(value-inits inits) ,@code)))
 
   (define (clr-call-instr op m)
     `(,op ,@(if (clr-method-static? m) '() '(instance))
@@ -1042,6 +1124,7 @@
      (hash-remove! scope-records (syntax-source stx))
      (define defs (of 'define))
      (define vals (of 'value))
+     (record-line-source! (syntax-source stx) (append defs vals (of 'expr)))
      (define val-names (for/list ([v vals]) (list-ref (syntax->list v) 1)))
      (define val-decls
        (for/list ([v vals] [i (in-naturals)])
@@ -1594,9 +1677,11 @@
      (define code
        (append* (for/list ([e (syntax->list #'(e ...))])
                   (define-values (ty code) (tc (inherit-stmt stx e)))
-                  (if (memq ty '(void never)) code (append code '((pop)))))))
+                  (append (line-marker e)
+                          code
+                          (if (memq ty '(void never)) '() '((pop)))))))
      (define-values (ty last-code) (tc (inherit-stmt stx #'last)))
-     (il ty (append code last-code))]))
+     (il ty (append code (line-marker #'last) last-code))]))
 
 (define-tui-form (tui-let stx)
   (syntax-parse stx
@@ -1615,7 +1700,8 @@
        (for ([x (in-list xs)] [t (in-list tys)]) (record-scope! x (tui-type->string t) start end)))
      (define ords (for/list ([x (in-list xs)]) (next-ordinal!)))
      (define cells? (for/list ([ord (in-list ords)]) (cell-ordinal? ord)))
-     (define slots (for/list ([ty tys] [c? cells?]) (alloc-local! stx (if c? (cell-of ty) ty))))
+     (define slots (for/list ([x (in-list xs)] [ty tys] [c? cells?])
+                     (alloc-local! stx (if c? (cell-of ty) ty) (syntax-e x))))
      ; A cell is created each time the let runs, so each run (for example, each loop iteration)
      ; gets a fresh variable.
      ; A cell's value is computed before the cell's array is pushed, so that the value can be a try
@@ -1836,7 +1922,7 @@
     (define owner (catch-owner (catch-clause-stx cc) ety))
     (define ord (next-ordinal!))
     (define cell? (cell-ordinal? ord))
-    (define slot (alloc-local! stx (if cell? (cell-of ety) ety)))
+    (define slot (alloc-local! stx (if cell? (cell-of ety) ety) (syntax-e e)))
     (define tmp (and cell? (alloc-local! stx ety)))
     (define-values (start end) (forms-span hforms))
     (record-tooltip! e ety)
