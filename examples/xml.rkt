@@ -60,7 +60,7 @@
        [else (raise-syntax-error 'node-kind "expected an XElement or XAttribute" this-syntax)]))
    #`#,msg])
 
-(define catalog-text : string
+(define catalog-text
   "<catalog><book id=\"1\" lang=\"en\"><title>Dune</title><price>9.5</price></book><book id=\"2\" lang=\"mi\"><title>Pukapuka</title><price>12</price></book><book id=\"3\" lang=\"en\"><title>Neuromancer</title><price>7.25</price></book></catalog>")
 
 (let ([root (XElement.Parse catalog-text)])

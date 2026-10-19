@@ -923,6 +923,48 @@
                          '(Console.WriteLine (g 1)))
                 '("7")))
 
+(test-case "module values infer their types, and a bare null needs an annotation"
+  (check-equal? (run-tui '(define n 5)
+                         '(define s "hi")
+                         '(define d 3.5)
+                         '(define t #t)
+                         '(define a (array int32 1 2 3))
+                         '(Console.WriteLine (+ n 1))
+                         '(Console.WriteLine s)
+                         '(Console.WriteLine d)
+                         '(Console.WriteLine t)
+                         '(Console.WriteLine (.Length a)))
+                '("6" "hi" "3.5" "True" "3"))
+  (check-equal? (run-tui '(define x : string null)
+                         '(define z x)
+                         '(define y (null-of string))
+                         '(Console.WriteLine (if (null? z) "null" "set"))
+                         '(Console.WriteLine (if (null? y) "null" "set")))
+                '("null" "null"))
+  (check-regexp-match #rx"module value null needs a type annotation, as in \\(define x : string null\\)"
+                      (tui-error '(define x null)))
+  (check-regexp-match #rx"null needs an expected reference type"
+                      (tui-error '(define x (if (< 1 2) null null)))))
+
+(test-case "an if with a bare null branch takes its type from the other branch"
+  (check-equal? (run-tui '(define v (if (< 1 2) null "s"))
+                         '(define w (if (< 1 2) "t" null))
+                         '(Console.WriteLine (if (null? v) "vnull" v))
+                         '(Console.WriteLine (if (null? w) "wnull" w)))
+                '("vnull" "t"))
+  (check-equal? (run-tui '(define (f) (if (< 1 2) "a" null))
+                         '(define (g) (if (< 2 1) null "b"))
+                         '(define (h) : string (if (< 1 2) null "c"))
+                         '(Console.WriteLine (f))
+                         '(Console.WriteLine (g))
+                         '(Console.WriteLine (if (null? (h)) "hnull" (h))))
+                '("a" "b" "hnull"))
+  (check-equal? (run-tui '(define (k [x : int]) (if (> x 0) "pos" null))
+                         '(Console.WriteLine (k 1)))
+                '("pos"))
+  (check-regexp-match #rx"null needs an expected reference type"
+                      (tui-error '(define (f) (if (< 1 2) null null)))))
+
 (test-case "an inferred return type that depends on itself is an error"
   (check-regexp-match #rx"cannot infer the return type of f, which depends on itself"
                       (tui-error '(define (f [n : int]) (if (< n 1) 1 (f (- n 1))))))

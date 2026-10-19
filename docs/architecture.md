@@ -264,7 +264,8 @@ pending is a cycle, and it is an error (`cannot infer the return type of f, whic
 itself`). So a recursive function, direct or mutual, needs a return type annotation. A definition
 can refer to any function or module value in the module, because every binding is set before any
 body is typed. A tail `null` or bare `fn` has no expected type in an unannotated body, so write
-`(null-of T)` or annotate the return type.
+`(null-of T)` or annotate the return type. An `if` with a bare `null` in one branch is the exception:
+`tui-if` takes the type from the other branch, or from the expected type when there is one.
 
 ### Bare fn placeholder
 
@@ -452,6 +453,8 @@ Rules:
 - A lambda that reads a module value needs no capture, because the value is a static field, and it
   sees the current value.
 - `set!` on a module value writes the field (`tui-set!` handles `tui-global`).
+- A bare `null` initializer has no type to infer, so `infer-value-type` raises
+  `module value null needs a type annotation`. An annotated `(define name : string null)` is fine.
 - A module value can be defined only in a module. A REPL interaction that defines one raises
   `module values can only be defined in a module`.
 
@@ -749,6 +752,7 @@ Common messages (the exact wording is in `main.rkt` and `private/clr.rkt`):
 - `expected (define (name [param : type] ...) [: type] body ...+)`
 - `cannot infer the return type of f, which depends on itself` (a recursive definition with no annotation)
 - `a module value cannot be void` (an unannotated module value whose expression is `void`)
+- `module value null needs a type annotation, as in (define x : string null)` (a bare `null` module value with no annotation)
 - `expected (fn [Delegate] (param ...) body ...+)`
 - `fn without a delegate type needs an expected delegate type or annotated parameters`
 - `fn has N parameters but X takes M`, `parameter n is T but D takes U`
@@ -830,6 +834,8 @@ and run `raco make main.rkt`.
 | `macros.rkt` | hygienic macros | `Tui macros are hygienic` |
 | `types.rkt` | `default-of`, `type-name-of`, `null?` on a null argument, `typeof` | `default-of takes a type name ...`, `type-name-of expands ...`, `null is typed from the expected type and works as an argument`, `typeof gives the System.Type of a type name` |
 | (inline tests) | `null-of` as a typed null in `let` and `set!`, and its rejections | `null-of declares a typed null where there is no expected type` |
+| (inline tests) | unannotated module values of each type, an annotated null, and the null module value error | `module values infer their types, and a bare null needs an annotation` |
+| (inline tests) | an `if` with a bare null branch in a module value, a function body, and a function with an expected type | `an if with a bare null branch takes its type from the other branch` |
 | `lists.rkt` | `list-of`, `sum-of`, `typedList` built from the type-pattern language | `the list-of example runs`, `sum-of reads the element type ...`, `typedList no longer takes a dictionary's value type ...` |
 | `type-patterns.rkt` | `define-type-syntax-class`, `type-match`, `type-matches?`: generics (open and closed), nested `<:`, named patterns, members and static members, method type parameters, combinators, predicates, `exactly` | `the type-patterns example exercises generic, member, named and combinator patterns` |
 | `collect.rkt` | `type-match` choosing how to fill a collection at compile time: `List`, `HashSet`, `Dictionary`, and nested collections by recursing on the element type | `collect fills lists, sets, dictionaries and nested collections, and rejects non-collections` |

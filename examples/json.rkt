@@ -9,16 +9,15 @@
 
 (record PNode [kind : int32] [key : string] [text : string] [num : float64] [first : int32] [next : int32])
 
-(define K-LIT : int32 0)
-(define K-NUM : int32 1)
-(define K-STR : int32 2)
-(define K-ARR : int32 3)
-(define K-OBJ : int32 4)
-(define K-MEMBER : int32 5)
-
-(define nodes : |System.Collections.Generic.List<PNode>| (new |System.Collections.Generic.List<PNode>|))
-(define src : string "")
-(define pos : int32 0)
+(define K-LIT 0)
+(define K-NUM 1)
+(define K-STR 2)
+(define K-ARR 3)
+(define K-OBJ 4)
+(define K-MEMBER 5)
+(define nodes (new |System.Collections.Generic.List<PNode>|))
+(define src "")
+(define pos 0)
 
 ; Tui has no runtime throw, so a parse error prints its message and exits with code 1.
 (define (fail [msg : string]) : int32
@@ -232,7 +231,7 @@
      [float64 #'(Console.WriteLine (Convert.ToString x CultureInfo.InvariantCulture))]
      [else (raise-syntax-error 'json-show "expected a string or float64" this-syntax)])])
 
-(define sample : string "{\"store\":{\"name\":\"Corner \\\"Books\\\"\",\"open\":true,\"books\":[{\"title\":\"Dune\",\"price\":9.5},{\"title\":\"Neuromancer\",\"price\":7.25}],\"owner\":null},\"tags\":[\"sf\",\"\\u0041bc\"]}")
+(define sample "{\"store\":{\"name\":\"Corner \\\"Books\\\"\",\"open\":true,\"books\":[{\"title\":\"Dune\",\"price\":9.5},{\"title\":\"Neuromancer\",\"price\":7.25}],\"owner\":null},\"tags\":[\"sf\",\"\\u0041bc\"]}")
 
 (let ([doc (parse-json sample)])
   (json-show (json-str-of (json-get doc "store" "name")))

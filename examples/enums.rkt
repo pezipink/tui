@@ -8,7 +8,7 @@
 (define (kind [d : System.DayOfWeek]) : string
   (if (weekend? d) "weekend" "weekday"))
 
-(define today : System.DayOfWeek System.DayOfWeek.Friday)
+(define today System.DayOfWeek.Friday)
 
 (Console.WriteLine System.DayOfWeek.Monday)
 (Console.WriteLine (kind today))

@@ -1,9 +1,9 @@
 #lang tui
 ; Module-level values: static fields, set during startup in source order.
 
-(define counter : int 5)
-(define doubled : int (* counter 2))
-(define adder : |Func<int32, int32>| (fn (x) (+ x counter)))
+(define counter 5)
+(define doubled (* counter 2))
+(define adder (fn ([x : int]) (+ x counter)))
 
 (define (bump) : void (set! counter (+ counter 1)))
 

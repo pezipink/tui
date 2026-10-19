@@ -600,6 +600,9 @@
   ; The type of the expression of a module value def, found by a discovery pass in the scope of
   ; the values set before it.
   (define (infer-value-type def earlier)
+    (define expr (last (syntax->list def)))
+    (when (bare-null? expr)
+      (raise-syntax-error 'tui "module value null needs a type annotation, as in (define x : string null)" def))
     (define-values (_code _m bty)
       (parameterize ([current-pass (pass #t (make-hasheqv) (make-hasheqv) 0 0)]
                      [value-scope earlier])
@@ -1779,8 +1782,28 @@
      (inherit-stmt stx #`(tui-if c #,then (tui-begin)))]
     [(_ c t e)
      (define ccode (tc/expect (inherit-stmt stx #'c) 'bool))
-     (define-values (tty tcode) (tc (inherit-stmt stx #'t)))
-     (define-values (ety ecode) (tc (inherit-stmt stx #'e)))
+     (define expected (syntax-property stx 'tui-expected))
+     ; A bare null branch takes its type from the expected type, or else from the other branch.
+     (define null-branch
+       (cond
+         [(and (bare-null? #'t) (not (bare-null? #'e))) 'then]
+         [(and (bare-null? #'e) (not (bare-null? #'t))) 'else]
+         [else #f]))
+     (define-values (tty tcode ety ecode)
+       (cond
+         [(and expected null-branch)
+          (values expected (tc/expect (inherit-stmt stx #'t) expected)
+                  expected (tc/expect (inherit-stmt stx #'e) expected))]
+         [(eq? null-branch 'then)
+          (define-values (ety ecode) (tc (inherit-stmt stx #'e)))
+          (values ety (tc/expect (inherit-stmt stx #'t) ety) ety ecode)]
+         [(eq? null-branch 'else)
+          (define-values (tty tcode) (tc (inherit-stmt stx #'t)))
+          (values tty tcode tty (tc/expect (inherit-stmt stx #'e) tty))]
+         [else
+          (define-values (tty tcode) (tc (inherit-stmt stx #'t)))
+          (define-values (ety ecode) (tc (inherit-stmt stx #'e)))
+          (values tty tcode ety ecode)]))
      (define-values (ty tc2 ec2)
        (cond
          [(equal? tty ety) (values tty tcode ecode)]

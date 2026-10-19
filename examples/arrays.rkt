@@ -9,7 +9,7 @@
     (for-each [x xs] (set! total (+ total x)))
     total))
 
-(define grid : |int32[][]| (array |int32[]| (array int32 1 2 3) (array int32 4 5 6)))
+(define grid (array |int32[]| (array int32 1 2 3) (array int32 4 5 6)))
 
 (let ([a (new-array int32 3)])
   (set! (aref a 0) 1)
